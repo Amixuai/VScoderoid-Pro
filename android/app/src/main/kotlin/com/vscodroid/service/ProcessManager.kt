@@ -1,0 +1,2652 @@
+package com.vscodroid.service
+
+import android.app.ActivityManager
+import android.content.Context
+import com.vscodroid.util.Environment
+import com.vscodroid.util.Logger
+import com.vscodroid.util.PortFinder
+import com.vscodroid.util.ServerLog
+import com.vscodroid.util.StorageManager
+import kotlinx.coroutines.delay
+import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.File
+import java.io.IOException
+import java.io.InputStreamReader
+import java.io.RandomAccessFile
+import java.io.Reader
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.util.UUID
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
+import androidx.core.content.edit
+
+/**
+ * Manages the Node.js server process lifecycle.
+ *
+ * Responsibilities:
+ * - Starting and stopping the Node.js server process
+ * - Health-checking the server -- see [isServerHealthy] for which endpoint and why
+ * - Monitoring process liveness via a watchdog thread
+ * - Streaming stdout/stderr output for diagnostics
+ *
+ * This class does NOT handle restart logic or Android service concerns;
+ * those belong to [NodeService].
+ */
+class ProcessManager(private val context: Context) {
+
+    private val tag = "ProcessManager"
+
+    /**
+     * Where the server's own output is kept for a bug report to pick up.
+     *
+     * Fed directly from [startOutputReader] rather than through [onServerOutput].
+     * That seam is public and documented as one, so a consumer assigning it would
+     * silently replace this writer, and the symptom would be a report that is
+     * empty again with nothing to say why.
+     */
+    private val serverLog = ServerLog(File(Environment.getLogsDir(context), "server.log"))
+
+    /**
+     * The spawned bootstrap, and the thread watching it.
+     *
+     * Volatile for the same reason as the flags below, and the two threads are
+     * named there too: both are written on whichever thread called [startServer],
+     * which `NodeService.launchServer` puts on `Dispatchers.IO`, and both are read
+     * and written on the main thread by [stopServer], which the notification's
+     * Stop action and `Service.onDestroy` both reach. Without it the second stop
+     * that `NodeService.shutdown` documents as the reaper for a process spawned
+     * inside its own window has no happens-before edge to that write, so it can
+     * read null over a live process and leave Node running with no service and no
+     * watchdog behind it.
+     */
+    @Volatile
+    private var serverProcess: Process? = null
+    private var serverRunId: String? = null
+    @Volatile
+    private var watchdogThread: Thread? = null
+
+    /**
+     * The port this instance serves on, written once per instance lifetime.
+     *
+     * Volatile for the same reason as the fields either side of it, and it was
+     * the one that missed out. It is written on whichever thread called
+     * [startServer] and read from three others: the main thread through
+     * `NodeService.getPort()` and the URL the WebView is pointed at, and both
+     * background watches through [probeVersion]. An int write is already atomic
+     * on the JVM, so the annotation is not about tearing; it is about the write
+     * being SEEN, and a reader that misses it asks its question about zero.
+     */
+    @Volatile
+    private var _port: Int = 0
+    @Volatile
+    private var isShuttingDown = false
+
+    // Volatile for the same reason isShuttingDown is: the watchdog thread clears
+    // it when the process exits, while the main thread reads it to decide whether
+    // to navigate the WebView.
+    @Volatile
+    private var _isReady = false
+
+    /**
+     * How many times readiness has been cleared, so a probe can tell whether it
+     * was cleared while it was asking.
+     *
+     * [probeReadiness] blocks for as long as its HTTP timeouts allow, and the
+     * writers that clear readiness run on other threads, so without this the
+     * later of the two writes wins and the probe is often the later one: it
+     * received its 200, the server died a moment afterwards, and the true it then
+     * records outlives the clear that was supposed to withdraw it.
+     *
+     * An epoch rather than a re-read of liveness on purpose. Liveness is what this
+     * class is careful never to derive readiness from, and it would answer the
+     * wrong thing here twice over: an adopted server has no process at all, and a
+     * server this instance spawned and lost still leaves its dead [Process]
+     * referenced. A counter says only "something withdrew readiness since you
+     * started asking", which is exactly the question.
+     *
+     * [AtomicInteger] only for the read that is deliberately unlocked: the one
+     * [probeReadiness] takes before its request goes out. The increment is not
+     * why: it happens in exactly one place, [clearReadiness], and [readinessLock]
+     * already serialises it against every other write.
+     */
+    private val readinessEpoch = AtomicInteger(0)
+
+    /** Invalidates crash delivery when a stop or start supersedes the server. */
+    internal val serverEpoch: Int get() = readinessEpoch.get()
+
+    /**
+     * What makes the epoch check and the write it guards one step.
+     *
+     * The epoch alone orders a probe against a clear, and that is only half of
+     * the interleavings: two probes overlap here as readily as a probe and a
+     * clear, because a launch that is superseded leaves its coroutine inside a
+     * blocking [probeVersion] that cancellation cannot reach, and the attempt
+     * that replaced it starts polling straight away. Without this, the loser
+     * wrote true, compared, and wrote false over a readiness the WINNER had
+     * already established and already announced, leaving [isReady] false for a
+     * server that is serving with nothing left to re-derive it. The next
+     * activity to bind then sits on the placeholder and no `onServerReady` is
+     * ever coming.
+     *
+     * [readinessEpoch] stays an [AtomicInteger] rather than becoming a plain int
+     * behind this, and the reason is the one read that is deliberately outside
+     * it: [probeReadiness] takes the epoch BEFORE its request goes out, so that
+     * read has to be safe on its own.
+     */
+    private val readinessLock = Any()
+
+    /**
+     * Whether the server being served is one this instance found rather than
+     * started.
+     *
+     * Volatile for the same reason the two above are: the watch thread clears it
+     * when the adopted server stops answering, and the main thread reads it.
+     *
+     * There is no [Process] behind an adopted server, so everything that reasons
+     * from `serverProcess` has to consult this too: the start guard, and
+     * [stopServer], which cannot kill what it did not spawn and says so instead
+     * of reporting success.
+     */
+    @Volatile
+    private var adopted = false
+
+    /**
+     * Whether the process the last [startServer] spawned went onto a port
+     * something else was already holding.
+     *
+     * Recorded at the spawn because that is the only moment the two cases can be
+     * told apart. Afterwards the port is occupied either way, and nothing in a
+     * later probe distinguishes a server of ours holding its own port from a
+     * stranger holding it while our process sits behind it unable to bind.
+     *
+     * Volatile for the same reason as the flags above: it is written on whichever
+     * thread called [startServer] and read from the service's main dispatcher.
+     */
+    @Volatile
+    private var spawnedOntoHeldPort = false
+
+    /**
+     * Whether the process the last [startServer] spawned has still to say it is
+     * listening.
+     *
+     * Set at the spawn and cleared by [startOutputReader] on the line
+     * `server-main.js` prints from its listen callback, [SERVER_LISTENING_LINE],
+     * which reaches this process because `assets/server.js` forks the editor
+     * server with its stdio inherited. While it is set, [probeReadiness] refuses
+     * whatever the port answers, and that is the one ownership test that does not
+     * ask the port. A 200 carrying the right commit proves only that something on
+     * the loopback knows a public value; this line can only have been printed by a
+     * child of ours after its own bind succeeded. Readiness is what carries the
+     * connection token to the port, so the party it is carried to has to be
+     * identified by something a stranger cannot say.
+     *
+     * The window it closes is wider than a restart onto a held port. Binding a
+     * loopback port needs no permission, so a process that takes the remembered
+     * port between the free check in [startServer] and the child's own listen
+     * leaves [spawnedOntoHeldPort] false and used to be handed readiness on a bare
+     * 200. A child that lost that race prints EADDRINUSE instead of this line, and
+     * the start now stays not ready for as long as it does.
+     *
+     * False for an adopted server, which spawned nothing: its ownership is the
+     * note's business, see [portHeldByOurEditorServer].
+     *
+     * Cleared only when the line came from the process that is still the current
+     * one, because a reader draining the previous process's pipe after a restart
+     * would otherwise vouch for a spawn it knows nothing about.
+     *
+     * Volatile for the same reason as the flags above: written on whichever thread
+     * called [startServer] and on the output reader, read on every probe.
+     */
+    @Volatile
+    private var listenUnreported = false
+
+    /**
+     * Whether [probeReadiness] has already said that the port is answering while
+     * the process this start spawned has not reported binding it.
+     *
+     * The poll asks five times a second for thirty seconds and then goes on
+     * asking, so an unthrottled line would be the whole of the log by the end of
+     * it while saying nothing the first one did not. Cleared beside
+     * [spawnedOntoHeldPort], at the spawn the line would describe.
+     */
+    @Volatile
+    private var unboundRefusalLogged = false
+
+    /**
+     * Whether the process the last [startServer] spawned was given a ceiling the
+     * user chose that is above the one the device would otherwise have had.
+     *
+     * The only consumer is the kill latch in `NodeService.handleServerCrash`, and
+     * what it is really recording is attribution: a SIGKILL only counts against a
+     * user's number if that number is what the dead process was running with, and
+     * only if that number could have caused the kill. [heapOverrideRaisesCeiling]
+     * is the second half.
+     *
+     * Volatile for the same reason as the flags above: written on whichever thread
+     * called [startServer], read from the service's main dispatcher.
+     */
+    @Volatile
+    private var heapOverrideActive = false
+
+    /**
+     * The user's number, as [heapCeilingForDevice] took it, or null when the
+     * ceiling was derived.
+     *
+     * Kept only so the start summary can name what was asked for beside what was
+     * given. Not volatile, and deliberately not: it is written and read on the
+     * one thread that is inside [startServer], a few statements apart, and giving
+     * it the annotation would tell the next reader that some other thread looks
+     * at it.
+     */
+    private var heapOverrideAskedMb: Int? = null
+
+    /**
+     * Whether the last spawn ignored a user-chosen ceiling because its budget of
+     * kills is spent.
+     *
+     * Derived at every spawn rather than remembered from the crash that spent the
+     * budget, and that is what makes it self-clearing: [requestedHeapCeiling]
+     * re-reads the value out of `settings.json` and the count out of preferences on
+     * every start, and [heapKillsForValue] gives a value the user has since changed
+     * a fresh count, so a repaired setting turns this off without anything having
+     * to remember to.
+     *
+     * One start derives nothing because it spawns nothing: the adoption branch of
+     * [startServer] clears this beside [heapOverrideActive], for the same reason
+     * it clears that one. An adopted server was given its ceiling by a bootstrap
+     * that is gone, so a value carried over from an earlier spawn in this instance
+     * is not about the server being served.
+     *
+     * The reader runs earlier than the writer once per start, which is why
+     * [stopServer] clears this too. `NodeService.onStartCommand` promotes to the
+     * foreground before it decides to serve, so the first card of a start is
+     * built ahead of the spawn that would set this; `announceReady` rebuilds it
+     * afterwards, so the stale window is a few seconds of a card and nothing more.
+     *
+     * Volatile for the same reason as the flags above: written on whichever thread
+     * called [startServer], read from the service's main dispatcher when the
+     * notification is built.
+     */
+    @Volatile
+    private var heapOverrideSuspendedNow = false
+
+    /** The port the server is listening on. Only valid after [startServer] returns true. */
+    val port: Int get() = _port
+
+    /**
+     * Whether the running server was started with a user-chosen heap ceiling that
+     * is HIGHER than the one this device would have been given anyway.
+     *
+     * False whenever no process of ours is running with one, which covers more
+     * than the plain case: a server that was adopted rather than spawned, and a
+     * server that has been stopped, both answer false. Both matter, because a
+     * crash attributed to a value the dead process never carried would spend the
+     * user's budget on something they did not do.
+     *
+     * The direction is part of the question, not a detail of the answer. The only
+     * consumer is the kill latch in `NodeService.chargeHeapOverride`, whose remedy
+     * is to ignore the user's number and fall back to the derived one, and that
+     * remedy is only a remedy when the user's number was the larger of the two.
+     * See [heapOverrideRaisesCeiling] for what a direction-blind flag cost.
+     */
+    fun heapOverrideInEffect(): Boolean = heapOverrideActive
+
+    /**
+     * Whether the ceiling in `settings.json` is currently being ignored.
+     *
+     * The counterpart to [heapOverrideInEffect] and not its negation: that one is
+     * "the running server was given the user's number", this one is "the user has
+     * a number and the last start refused to use it". Both are false in the
+     * ordinary case where nobody set anything.
+     *
+     * Exists because the suspension has no other lasting voice. It is raised once,
+     * through `NodeService.chargeHeapOverride`, into a callback that is null with
+     * no activity bound and into a record the very next `launchServer` clears, and
+     * the suspension itself lasts until the user edits the value. So the answer is
+     * put where a condition that outlives a toast belongs, on the foreground
+     * notification, which stays up for as long as the condition does.
+     */
+    fun heapOverrideIgnored(): Boolean = heapOverrideSuspendedNow
+
+    /**
+     * Whether the server on the port was adopted rather than started here.
+     *
+     * Exposed so callers can distinguish "we have a server" from "we control the
+     * server", which are the same question only while we started it.
+     */
+    fun isAdopted(): Boolean = adopted
+
+    /** The editor server pid the note named when readiness was last announced, 0 before. */
+    @Volatile
+    private var announcedEditorPid = 0
+
+    /** Whether the last adoption found the editor server [announcedEditorPid] names. */
+    @Volatile
+    private var adoptedAnnouncedServer = false
+
+    /**
+     * Records which editor server readiness is being announced for. `NodeService`
+     * calls it on every announcement, spawned or adopted, so the next adoption can
+     * tell a survivor of the page's own server from some other child.
+     */
+    fun markReadyAnnounced() {
+        announcedEditorPid = recordedEditorPid()
+    }
+
+    /**
+     * Whether the server now ready is the very editor server readiness was last
+     * announced for, reached again by adopting it after its bootstrap died.
+     *
+     * The page loaded against that server is still connected to it: a SIGKILLed
+     * `server.js` takes nothing of its child with it. Reloading there restarts the
+     * extension host and drops what has not been backed up, for a connection that
+     * never broke. A different pid, which is an adopted child of a restart the page
+     * never saw, answers false, because the page's own server is gone.
+     */
+    fun continuesAnnouncedServer(): Boolean = adopted && adoptedAnnouncedServer
+
+    /** The pid the bootstrap's note names, or 0 when there is no readable note. */
+    private fun recordedEditorPid(): Int = try {
+        val note = File(Environment.getServerDir(context), EDITOR_PID_FILE)
+        if (note.isFile) JSONObject(note.readText()).optInt("pid", 0) else 0
+    } catch (_: Exception) {
+        0
+    }
+
+    /**
+     * Whether a server of ours is still there, spawned or adopted.
+     *
+     * The question every "is it merely slow" decision means to ask, and
+     * [isRunning] answers it only for a server this instance spawned. An adopted
+     * server has no [Process] at all, so `serverProcess?.isAlive` is false for one
+     * that is serving perfectly well, and a caller bounded by that reads a healthy
+     * adopted server as a dead one: `NodeService.launchOutcome` calls it
+     * DIED_BEFORE_ANSWERING, which the crash path is supposed to own and which
+     * nothing then retries, and `NodeService.awaitLateReadiness` leaves its loop on
+     * the first turn.
+     *
+     * Not a readiness question and not a substitute for one. [isReady] is still
+     * what decides whether the WebView may be pointed at the port; this only says
+     * whether there is anything left whose answer could still change.
+     */
+    fun hasLiveServer(): Boolean = isRunning() || adopted
+
+    /**
+     * Whether the running process was spawned onto a port that was already taken,
+     * and therefore cannot ever serve.
+     *
+     * The editor server it forks prints `EADDRINUSE` and then does **not** exit,
+     * measured on an API 36 emulator, same pids at 0, 5, 15, 30 and 60 seconds,
+     * so the bootstrap does not exit either and [isRunning] answers true for as
+     * long as nothing kills it. Liveness therefore says nothing here, and the
+     * caller that waits on liveness would wait forever: see
+     * `NodeService.awaitLateReadiness`, whose loop is bounded by exactly that.
+     *
+     * Answered from what was true at the spawn rather than from a fresh probe,
+     * because a fresh probe cannot separate the two things it would have to: a
+     * held port looks the same whether the holder is the server we started or the
+     * stranger our server lost the race to.
+     */
+    fun spawnedOntoHeldPort(): Boolean = spawnedOntoHeldPort
+
+    /**
+     * The connection token the server requires on every route except `/version`,
+     * `/delay-shutdown` and `/callback`, as held by the server this instance last
+     * saw become ready, or null whenever it is not ready.
+     *
+     * Null while not ready because the port may be anyone's then: binding a
+     * loopback port needs no permission, and everything that reads this sends the
+     * value to that port. [probeReadiness] reads the file, under the same epoch as
+     * the readiness it records, and [rotateConnectionToken] replaces it before
+     * every spawn, so a token handed to whoever held the port while ours was down
+     * authenticates against no server that comes back.
+     *
+     * The server decides what it accepts: with no connection-token flag on its
+     * command line it reads the file [Environment.getConnectionTokenPath] names,
+     * keeps content matching `[0-9A-Za-z_-]+`, and otherwise writes a new token
+     * there with mode 0600.
+     */
+    val connectionToken: String?
+        get() = if (_isReady) cachedToken else null
+
+    @Volatile
+    private var cachedToken: String? = null
+
+    /**
+     * Where `/proc` is mounted. A constant in production, and a `var` only so the
+     * suite can point it at a fixture: the machines these tests run on have no
+     * `/proc` at all, so a test for [portHeldByOurEditorServer] that used the real
+     * path could only ever exercise the "process is gone" branch and would report
+     * a passing adoption test while never adopting anything.
+     */
+    private var procDir = File("/proc")
+
+    /**
+     * How [reapRecordedEditorServer] and [killBootstrap] signal a process. A `var` for the
+     * same reason [procDir] is one: the suite runs on a JVM where `android.os.Process` is a
+     * stub, so a test calling through to it could only ever assert that nothing happened.
+     */
+    internal var killRecordedProcess: (Int) -> Unit = { android.os.Process.killProcess(it) }
+
+    /**
+     * The clock [waitForReady] measures its budget on, in nanoseconds.
+     *
+     * Monotonic, which is the whole requirement: the wall clock is corrected out
+     * from under a running app and the poll's bound must not move with it. See
+     * [waitForReady] for what a correction did to it.
+     *
+     * [System.nanoTime] rather than `SystemClock.elapsedRealtime`, which is what
+     * `NodeService.awaitLateReadiness` uses for the same event. Both are immune to
+     * a time correction, which is all this needs; they differ only over deep
+     * sleep, and this poll runs for thirty seconds with the launch in front of the
+     * user. What decides it is that this loop is reachable from the JVM suite,
+     * where every `android.os` member is a stub that throws, and the bound is the
+     * thing the suite has to be able to pin.
+     *
+     * A `var` for the same reason [procDir] is one, and not for a production
+     * caller: a time correction cannot be staged from a test, so a fake clock is
+     * the only way to show the loop is bounded by this and not by the wall.
+     */
+    internal var nanoClock: () -> Long = { System.nanoTime() }
+
+    // Read only by [probeReadiness], off the main thread, and kept in [cachedToken]
+    // until the next readiness replaces it: the getter is asked on every
+    // intercepted request, and the workbench issues hundreds during a cold load.
+    private fun readTokenFile(): String? = try {
+        File(Environment.getConnectionTokenPath(context))
+            .takeIf { it.isFile }
+            ?.readText()
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+    } catch (e: Exception) {
+        Logger.w(tag, "Could not read the connection token: ${e.message}")
+        null
+    }
+
+    /**
+     * Gives the server about to be spawned a token no earlier one held.
+     *
+     * While our server is down the port can be bound by anything, and the page
+     * and its cookie may have sent it the old token by then. A new one per spawn
+     * makes what they sent worthless to the server that comes back.
+     *
+     * Rewritten in place rather than deleted for the server to create again: a
+     * new file needs a free inode and block, and on a full partition the server
+     * swallows the failed write and runs with a token nobody can read, so every
+     * page load would be refused. A UUID matches the server's own format, so it
+     * reads the file and never writes it. A link is never written through, since
+     * `setLength` would truncate whatever it points at; it is removed instead,
+     * as is a file that could not be rewritten, and the server then mints one.
+     */
+    private fun rotateConnectionToken() {
+        val file = File(Environment.getConnectionTokenPath(context))
+        val path = file.toPath()
+        if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+            try {
+                val fresh = UUID.randomUUID().toString().toByteArray(Charsets.US_ASCII)
+                RandomAccessFile(file, "rw").use {
+                    it.write(fresh)
+                    it.setLength(fresh.size.toLong())
+                }
+                return
+            } catch (e: IOException) {
+                Logger.w(tag, "Could not rewrite the connection token: ${e.message}")
+            }
+        }
+        try {
+            Files.deleteIfExists(path)
+        } catch (e: IOException) {
+            Logger.w(tag, "Could not replace the connection token; the new server will reuse it")
+        }
+    }
+
+    // -- Callbacks --
+
+    /**
+     * Invoked on the watchdog thread when the server process exits unexpectedly.
+     *
+     * The thread matters to the receiver: `NodeService.setupProcessCallbacks()`
+     * does nothing here but hand the exit code to its own scope, because the
+     * state it needs to touch belongs to that scope's thread.
+     *
+     * This is the only callback of the pair that ever existed. A sibling named
+     * `onServerRestarting` sat beside it with no assignment and no call site, and
+     * `onServerReady` sat here too, a name [waitForReady]'s return value already
+     * carried, and one shared with a live callback on `NodeService` that
+     * `MainActivity` does assign. Two identically named callbacks in adjacent
+     * layers, one of them dead, is a trap for whoever wires up the next one; both
+     * are gone rather than documented as dead.
+     */
+    var onServerCrashed: ((exitCode: Int) -> Unit)? = null
+
+    /** Invoked on the output-reader thread for every line of server stdout/stderr. */
+    var onServerOutput: ((line: String) -> Unit)? = null
+
+    // -- Lifecycle --
+
+    /**
+     * Starts the Node.js server process.
+     *
+     * Resolves the port on the first call and keeps it for the lifetime of this
+     * instance, builds the command line from [Environment] paths, spawns the
+     * process, and begins output reading and watchdog monitoring.
+     *
+     * @return `true` if the process was spawned successfully, `false` on error or
+     *         if a live process is already running.
+     */
+    fun startServer(): Boolean {
+        // Liveness, not nullity: the crash path leaves the dead Process referenced,
+        // so a null check here refused every automatic restart attempt (issue #3).
+        //
+        // `adopted` is the second half of the same question. There is no Process
+        // behind an adopted server, so `isRunning()` answers false for one that is
+        // serving perfectly well, and without this a restart would spawn a second
+        // server onto a port the first still holds.
+        if (isRunning() || adopted) {
+            Logger.w(tag, "Server already running")
+            return false
+        }
+
+        isShuttingDown = false
+        // A server that is starting is not serving, and this is the assignment
+        // that makes a restart honest: the flag survives in this instance across
+        // restarts exactly as the port does, so leaving it set would report the
+        // previous server's readiness for the new one during the seconds it takes
+        // to bind.
+        clearReadiness()
+        // Keep the port across restarts. The WebView's loaded URL and the WebViewClient
+        // are both bound to it, and neither is rebuilt on restart: initBridge() guards on
+        // bridgeInitialized (MainActivity.initBridge), so the client keeps the port it
+        // was constructed with, and it is what CDN interception and the localhost check
+        // read (VSCodroidWebViewClient.shouldInterceptRequest and its isLocalhost).
+        // This used to cite the bridge's allowed-origin
+        // check as the second binding; that check was removed in #144 because nothing
+        // called it.
+        // Across cold starts it is the workbench's IndexedDB that is bound to it:
+        // see PortFinder.getOrAllocatePort.
+        //
+        // Whether it is free is asked once and held, because two decisions turn
+        // on that one answer: whether to adopt, and whether the spawn further
+        // down has any chance of binding. Asking twice would let the port change
+        // hands in between and record a doomed spawn as a healthy one. A port
+        // this call allocates is free by construction, PortFinder either
+        // verified the remembered one or scanned for another.
+        //
+        // On the FIRST start in this process the candidate is the REMEMBERED port,
+        // not whatever the allocator would hand back, and that difference is the
+        // whole of the adoption path. `getOrAllocatePort` answers a held port by
+        // moving to a free one, so it can only ever return a port nothing is
+        // holding: the true below was unconditional on every cold start, both
+        // readers of the note are gated on its negation, and adoption could not run
+        // on the one launch it exists for, a server that outlived the process that
+        // spawned it. Moving is not free either; it is the line PortFinder logs as
+        // "Workbench storage keyed to the old origin is lost".
+        //
+        // Re-deriving the port here is not the re-derivation the note above
+        // forbids. That one is about a port this instance has already published to
+        // the WebView and its client. Nothing has seen this one: `_port` is zero
+        // only on an instance that has never started a server, MainActivity reads
+        // the port only beside `isServerReady()`, which is false throughout, and
+        // the replacement happens inside this same call.
+        val firstStart = _port == 0
+        if (firstStart) _port = PortFinder.rememberedPort(context)
+        var portIsFree = if (_port == 0) {
+            _port = PortFinder.getOrAllocatePort(context)
+            true
+        } else {
+            PortFinder.isPortAvailable(_port)
+        }
+        if (!portIsFree && portHeldByOurEditorServer() && recordedServerIsServing()) {
+            // A server of ours is already on the port. Serve it instead of
+            // spawning a second one that cannot bind.
+            //
+            // This is the case the long note below is about, and it is the common
+            // one rather than the exotic one: `assets/server.js` forks the editor
+            // server and forwards SIGTERM, but a SIGKILLed `server.js` -- routine
+            // here, it is what the watchdog's 137 branch exists for -- forwards
+            // nothing and `fork()` sets no PDEATHSIG, so the child outlives its
+            // parent still holding the socket. It is not wreckage: it is a live,
+            // healthy editor server, the one the open WebView is still talking to.
+            //
+            // Measured on an API 36 emulator: spawning anyway produced a parent
+            // that never becomes the server. Its child printed
+            // `code: 'EADDRINUSE'` and did NOT exit, so this class ended up
+            // watching a process whose death means nothing while the process that
+            // serves the user was untracked. Adopting removes that second process
+            // entirely and puts the watch on the one that matters.
+            //
+            // The ownership test is what makes this safe to do at all. Anything
+            // can hold a loopback port on Android, so the holder cannot be the one
+            // asked: [portHeldByOurEditorServer] reads a note the bootstrap wrote
+            // into app-private storage naming the pid it forked, and checks that
+            // process is still alive and still that server. A holder we have no
+            // note for falls through and is spawned over, which fails the way it
+            // always did rather than the way a refusal would.
+            //
+            // Ownership is only half of it, and the note cannot supply the other
+            // half: it is written at the fork, so it names a process that was
+            // asked to bind the port rather than one that did.
+            // [recordedServerIsServing] asks the port itself before this branch is
+            // taken, see there for what a note alone lets through, and why the
+            // two questions are not interchangeable.
+            Logger.i(tag, "Port $_port already served by a server of ours; adopting it")
+            // The same window the spawn below guards, on the branch that has no
+            // Process to destroy, and the decision above is where it opens.
+            // [recordedServerIsServing] spends a second of connect and a second of
+            // read against the port, and [stopServer] runs on the main thread: a
+            // Stop pressed inside that round trip reads `adopted` as false, so it
+            // reaps nothing and returns, and the assignments below would then clear
+            // the flag that stop had just set and record the orphan as this
+            // instance's server. What the user is left with is exactly the state
+            // adoption exists to end, now with the service gone: an editor server
+            // holding the port that nothing is tracking, and the poll
+            // [startAdoptionWatch] would have started over it, both outliving the
+            // stop that was supposed to take them.
+            //
+            // Ended rather than merely declined, for the reason [stopServer]'s own
+            // adopted branch gives: the note names the pid, and a stop is the user
+            // asking for the server to be gone rather than for it to be left
+            // untracked. Placed before every assignment below, because a return
+            // taken after any of them would publish state describing a server this
+            // start is not going to serve.
+            if (isShuttingDown) {
+                Logger.i(tag, "A stop landed while the server was being adopted; ending it instead")
+                reapRecordedEditorServer("a stop landed while it was being adopted")
+                return false
+            }
+            // Nothing is warned about here, and that is a change rather than an
+            // omission. An adopted server is by construction one whose bootstrap
+            // is gone, and while the DNS proxy was bound by that bootstrap the
+            // survivor kept pointing HTTPS_PROXY at a closed port that no running
+            // process can be made to forget: the Open VSX gallery, the agent host,
+            // and git, npm and curl in every terminal (they inherit the same
+            // environment) all failed to reach the network for the rest of the
+            // session, while the workbench itself looked perfectly healthy.
+            // `assets/server.js` now preloads `assets/dns-proxy.js` into the child
+            // it forks and the child binds its own listener, so the proxy has
+            // exactly the lifetime of the server that uses it and a survivor
+            // carries a working one. Read those two files before putting any
+            // warning back here.
+            adopted = true
+            adoptedAnnouncedServer = recordedEditorPid().let { it > 0 && it == announcedEditorPid }
+            clearReadiness()
+            // Nothing was spawned, so the flag describes nothing. Cleared rather
+            // than left, because it survives in this instance across attempts and
+            // a value left over from a previous one is not about this server.
+            spawnedOntoHeldPort = false
+            // Nothing was spawned, so there is no listen to wait for either. The
+            // note vouched for this holder before it was adopted, which is the
+            // ownership test this branch rests on; a flag left set from an
+            // earlier spawn in this instance would refuse readiness to a server
+            // that is serving, and nothing would ever clear it.
+            listenUnreported = false
+            // The same reasoning, and a sharper consequence. An adopted server was
+            // spawned by a bootstrap that is gone, and it carries whatever ceiling
+            // that bootstrap gave it -- which is unknowable from here and is not
+            // whatever this instance last read out of settings.json. Left set, the
+            // user's number would be charged for a kill of a process that never
+            // ran with it, and three of those disable a value that was never tried.
+            heapOverrideActive = false
+            // And the same for the suspension, which [heapOverrideSuspendedNow]
+            // documents as derived at every spawn: this branch is the one start
+            // that spawns nothing, so a value left standing here describes some
+            // earlier process rather than the one being served, and the running
+            // card would tell the user their ceiling had just been turned off on
+            // a start that never read it.
+            heapOverrideSuspendedNow = false
+            startAdoptionWatch()
+            return true
+        }
+        // An editor server of ours that is alive, holds the port, and is not one this
+        // start can adopt is the one shape worth ending before spawning over it. Adoption
+        // already declined it just above, and leaving it there guarantees the spawn below
+        // hits EADDRINUSE: that child does not exit, so the run ends in CANNOT_BIND with
+        // two processes where the user wanted one, and the survivor outlives every retry.
+        //
+        // Three declines reach here and only one of them is silence, so the reason is not
+        // repeated in the reap: [recordedServerIsServing] has already logged which of them
+        // it was. `/version` did not answer within a second, which a server still starting
+        // up could fail; or it answered as a different build, which an orphan left by an
+        // earlier app version does; or this build could not read its own commit, so the
+        // port was never asked at all.
+        //
+        // The last two end a process that may be serving perfectly well, and that is a
+        // decision rather than an oversight. What it is serving is not this build, or
+        // cannot be shown to be, and the alternative is not "leave the user's editor
+        // alone" but a launch that fails for as long as the holder lives, because nothing
+        // here can bind the port while it is held and `_port` is re-derived only on the
+        // first start in a process. A server ended a second early is restarted by the
+        // line below; one left alone is not.
+        //
+        // On a first start as well, and ABOVE the move that follows. The move used to
+        // come first, on the reasoning that a cold start had a way out a restart did
+        // not and that the reap was argued from "the spawn is about to hit this port".
+        // What that ordering cost was the orphan itself: an editor server of this
+        // build that took longer than a second to answer `/version` under cold-start
+        // load was declined, the port was abandoned to it, and nothing ever ended it,
+        // so it kept a Node heap and one of the 32 phantom-process slots until the OS
+        // took them back, while the workbench storage keyed to its origin was lost
+        // for nothing. Reaping first is what the restart path has always done with
+        // the same three declines; what is new is only that the cold start no longer
+        // walks away before it gets the chance.
+        //
+        // The reap is subtracted only when the port agrees it is free, because a
+        // signalled pid is not a released socket: the kill returns when the signal
+        // is sent, and the holder can also be a foreign process the reap never
+        // touched, the note naming a wedged child that never bound while someone
+        // else took the port. Answering from the signal alone would call that spawn
+        // healthy while it wedges on EADDRINUSE without exiting, and the
+        // liveness-bounded wait behind [spawnedOntoHeldPort] would never end: the
+        // failure the restart budget used to report, become a "still starting" that
+        // says nothing. The probe is the same loopback bind test [PortFinder]
+        // already answers, and its residual race, a port freed just after it reads
+        // held, is the one the free-at-first-ask path has always accepted. Asked
+        // through [portFreedByReap] rather than once, because after a reap that
+        // race is not residual but the likely answer: see there.
+        if (!portIsFree && portHeldByOurEditorServer()) {
+            val reaped =
+                reapRecordedEditorServer("not adoptable by this start, for the reason logged above")
+            if (reaped && portFreedByReap()) portIsFree = true
+        }
+        // A candidate this start still cannot claim is not a port to spawn onto, and
+        // on a first start there is a way out that a restart does not have: nothing
+        // is bound to it yet, so moving costs only the workbench storage the
+        // allocator already logs, while spawning costs a child that wedges on
+        // EADDRINUSE without exiting. What reaches here on a cold start is a holder
+        // that is not ours, or a reap whose socket the kernel had not closed inside
+        // the grace; a reap that did free the port keeps it, and the origin with it.
+        if (firstStart && !portIsFree) {
+            _port = PortFinder.getOrAllocatePort(context)
+            portIsFree = true
+        }
+
+        // Reaching here means the port was free, or was held by something that is
+        // not ours. Nothing refuses to start in either case, and that is a
+        // decision rather than an omission: a refusal was tried and removed. What
+        // follows is what it cost and what the real problem was, because the idea
+        // is an obvious one to have again.
+        //
+        // The situation it aimed at: `assets/server.js` forks the editor server
+        // and forwards SIGTERM to it, but a `server.js` that is SIGKILLed --
+        // routine here, it is what the watchdog's 137 branch exists for --
+        // forwards nothing, and `fork()` sets no PDEATHSIG. So the child outlives
+        // its parent still holding the port. `assets/process-monitor.js` does not
+        // reap it: it kills nothing, and it runs inside the parent it would have
+        // to outlive.
+        //
+        // The trap is what that child IS. It is not a stranger and it is not
+        // wreckage -- it is a live, healthy editor server, the one the open
+        // WebView is still talking to. Refusing to start because the port is held
+        // therefore takes a working editor away from the user, in the common case,
+        // to fix bookkeeping. It also cannot recover: `_port` is written only
+        // while it is zero, so nothing re-derives it, and a refusal repeats for
+        // the life of this instance.
+        //
+        // What IS wrong is that nothing distinguishes the survivor from a server
+        // this class started. The health probe read a response code, so a
+        // survivor satisfied readiness, `NodeService.announceReady` fired, and the
+        // WebView was pointed at it. That much worked -- the token matched,
+        // because `server.js` reused the token file -- which is why nothing
+        // downstream noticed. It no longer passes: [probeReadiness] now waits for
+        // the process this start spawned to say it is listening, and a spawn that
+        // lost the port never does, so a start onto a held port ends in
+        // CANNOT_BIND rather than in the survivor's readiness. The cost of the
+        // old shape was everywhere the app assumed the server it was serving was
+        // the one it spawned:
+        //
+        //  - `serverProcess` refers to the process spawned here, not the survivor.
+        //    So [stopServer] destroys the wrong one. Stop takes the notification
+        //    down, reports success, and `MainActivity`'s `onServerStopped` closes
+        //    the editor with `finishAndRemoveTask()` -- while the survivor is
+        //    still running, still serving, still holding the port, and now with no
+        //    foreground service tracking it at all.
+        //  - the next cold start finds the port taken, and
+        //    `PortFinder.getOrAllocatePort` moves to another one. It says so
+        //    itself: "Workbench storage keyed to the old origin is lost." That is
+        //    IndexedDB and localStorage -- signed-out sessions, every extension's
+        //    globalState, the sealed secrets -- discarded with no user-visible cause.
+        //  - and the restart budget is refilled by the survivor answering, so this
+        //    class can never conclude that anything is wrong. Note what that does
+        //    and does not mean: an earlier version of this note said the children
+        //    that cannot bind "respawn without bound", and the measurement below
+        //    refutes it -- they do not exit, so nothing respawns. The cost is not
+        //    churn, it is that the terminal state becomes unreachable while the
+        //    condition lasts.
+        //
+        // And the process spawned here never becomes the server. Measured on an
+        // API 36 emulator, killing the parent and leaving the child: the survivor
+        // was still LISTENING on the port after sixty seconds, reparented to init;
+        // the child of the newly spawned parent printed
+        // `code: 'EADDRINUSE', syscall: 'listen'` and then did NOT exit. Same pids
+        // at 0, 5, 15, 30 and 60 seconds -- no churn, no respawn -- and the
+        // workbench on screen was never reloaded, which its hour-old unsent chat
+        // text proved better than any log could.
+        //
+        // So the steady state is two servers with the roles swapped. The one this
+        // class manages is alive, watched, and serving nothing, forever. The one
+        // serving the user is untracked. `stopServer` can only reach the first,
+        // which makes the second unkillable by any route the app has, and the
+        // first immortal. The watchdog watches a process whose death would mean
+        // nothing and cannot see the one whose death would take the editor away.
+        //
+        // Worth knowing before designing the fix: the app already SEES this
+        // happen. `startOutputReader` receives that EADDRINUSE line and now
+        // writes it to `server.log`, so a bug report carries it. The same line
+        // also goes to `Logger.d`, which in a release build is nowhere, and to
+        // [onServerOutput], which still has no production consumer.
+        //
+        // What the spawn below now does NOT do is last forever. A pair that
+        // cannot bind stays alive indefinitely, the measurement above is the
+        // proof, so every question the app asks about it answers "still
+        // starting", and the launch path waits on liveness. [spawnedOntoHeldPort]
+        // is what ends that: the service reads it when the start poll gives up on
+        // a live process, kills the pair and spends a restart instead of watching
+        // it for the life of the app. The port is deliberately not re-derived
+        // here, because the WebView and its client are built around the one this
+        // instance already published; a start that keeps failing therefore ends
+        // in the terminal state, which says so on the notification.
+        //
+        // Those are the defects worth fixing, and none of them is fixed by
+        // refusing to start. Do not read the list as an argument for putting the
+        // refusal back: refusing produced a state the user could not reach the
+        // editor from at all, which is worse than every line above.
+        //
+        // ALL THREE ARE ADDRESSED BY THE ADOPTION BRANCH ABOVE, which is why the
+        // list above is written in the past tense of a defect rather than as a
+        // standing one. Adoption makes `serverProcess` and the thing on the port
+        // the same subject again -- by having no second subject at all -- and that
+        // is where all three came from.
+        //
+        // What it does NOT fix, and this is the honest residue: an adopted server
+        // still cannot be killed by this app, because there is no handle to it.
+        // [stopServer] says so now instead of destroying the wrong process and
+        // reporting success, which is a smaller claim than "Stop works" and a true
+        // one. And the IndexedDB loss on a cold start is narrowed rather than
+        // gone: a fresh instance that finds the remembered port held by a
+        // stranger, or by a server of ours whose socket the reap above could not
+        // free in time, still moves with `PortFinder` and takes the origin with
+        // it. What no longer loses it is an orphan of ours that answers too slowly
+        // to adopt, which is now ended and its port kept.
+        //
+        // The objection that kept adoption out until now was real and had to be
+        // answered rather than accepted: an adopted server has no `Process`, so no
+        // watchdog, so its death would go unnoticed -- trading the loud failure
+        // the refusal was removed for against a silent one, in the other
+        // direction. [startAdoptionWatch] is that answer. It polls, because a
+        // signal a `Process` gives for free has to be asked for here, and reports
+        // through the same `onServerCrashed` the watchdog uses, so recovery is the
+        // path that already exists rather than a second one.
+        //
+        // If that watch is ever removed or weakened, adoption stops being safe and
+        // the trade comes back. It is the load-bearing half.
+        //
+        // Recorded before the spawn, because this is the last moment it can be
+        // known: from here on the port is occupied whichever case this is. It is
+        // what lets the service tell a slow server from one that will never
+        // answer, see [spawnedOntoHeldPort] and `NodeService.awaitLateReadiness`.
+        // A port the reap freed inside its grace has already been folded into
+        // the answer above, and so has a first start's move to a free one.
+        spawnedOntoHeldPort = !portIsFree
+        unboundRefusalLogged = false
+        // Below the adoption branch, which returned above: an adopted server holds
+        // the token it started with in memory and must keep the file that names it.
+        rotateConnectionToken()
+        Logger.i(tag, "Starting server on port $_port")
+
+        // Ensure TMPDIR is a usable directory: Android may clear cache between
+        // launches.
+        //
+        // `isDirectory` rather than `exists`, and the return value of `mkdirs` is
+        // read rather than discarded. Both halves are the same mistake: the test
+        // asked whether *something* was at that path while the code meant whether
+        // a *directory* was, and they part company exactly when a file sits there,
+        // at which point `mkdirs` cannot succeed and said so to nobody. This
+        // path is TMPDIR and TMUX_TMPDIR for the server (Environment), so the
+        // failure would surface later as temporary-file errors with no visible
+        // connection to it.
+        //
+        // Not fatal to a start. A server with a broken TMPDIR is worse than one
+        // with a working one and far better than none, and the log line is what
+        // makes the eventual symptom traceable.
+        val tmpDir = File(context.cacheDir, "tmp")
+        if (!tmpDir.isDirectory && !tmpDir.mkdirs()) {
+            Logger.w(tag, "Could not create TMPDIR at ${tmpDir.path}; " +
+                "the server may fail on temporary files")
+        }
+        StorageManager.pruneTemporaryBytecode(context)
+        StorageManager.removeLegacyPipCache(context)
+
+        val nodePath = Environment.getNodePath(context)
+        val serverScript = Environment.getServerScript(context)
+        val env = Environment.buildProcessEnvironment(context, _port)
+        val runId = UUID.randomUUID().toString()
+
+        // These arguments reach server.js, not the editor server it forks. server.js
+        // reads host, port and log as defaults and forwards exactly four keys --
+        // extensions-dir, user-data-dir, server-data-dir and logsPath -- while
+        // building the rest of the command itself. Two flags that used to sit here,
+        // --without-connection-token and --accept-server-license-terms, were read by
+        // nobody: server.js writes its own. They are gone rather than corrected,
+        // because an argument that looks decisive and does nothing is worse than a
+        // missing one, and the next person to change authentication would have
+        // started here.
+        val heapMb = heapCeilingForDevice()
+        val command = listOf(
+            nodePath,
+            "--max-old-space-size=$heapMb",
+            serverScript,
+            "--host=127.0.0.1",
+            "--port=$_port",
+            "--extensions-dir=${Environment.getExtensionsDir(context)}",
+            "--user-data-dir=${Environment.getUserDataDir(context)}",
+            "--server-data-dir=${Environment.getUserDataDir(context)}",
+            "--logsPath=${Environment.getLogsDir(context)}",
+            "--log=info"
+        )
+
+        return try {
+            val processBuilder = ProcessBuilder(command).apply {
+                environment().putAll(env)
+                environment()["VSCODROID_SERVER_RUN_ID"] = runId
+                redirectErrorStream(true)
+                directory(context.filesDir)
+            }
+            val spawned = processBuilder.start().also { it.outputStream.close() }
+            // A stop that landed while this was spawning has to take the process
+            // it could not see. [stopServer] runs on the main thread and reads
+            // `serverProcess`, which is still null everywhere above this line, so
+            // a Stop pressed inside the few milliseconds `ProcessBuilder.start()`
+            // takes destroys nothing and returns, and what it leaves behind is a
+            // Node process with no foreground service tracking it, no watchdog
+            // (this returns before either is started), and the editor port in its
+            // hand. The next cold start then either adopts it, which keeps the
+            // session and the working DNS proxy that survivor carries, or moves to
+            // another port and takes the workbench's IndexedDB with it.
+            //
+            // Read after the spawn rather than before it, because before it the
+            // answer is meaningless: the window this closes opens at the spawn.
+            synchronized(readinessLock) {
+                if (isShuttingDown) {
+                    Logger.i(tag, "A stop landed while the server was spawning; ending it again")
+                    spawned.destroyForcibly()
+                    return false
+                }
+                serverRunId = runId
+                serverProcess = spawned
+                // Publish the owner and its readers together so Stop captures one run.
+                listenUnreported = true
+                startOutputReader()
+                startWatchdog()
+            }
+            // The source is named, not only the number. A ceiling in a bug report
+            // that could be either a derived value or a user's is a number nobody
+            // can act on.
+            //
+            // What was asked for is named too, and only the word "clamped" is
+            // conditional on it. The line used to say "clamped" for every honoured
+            // override, including the common case where the request passed through
+            // untouched, so a reader was told the app had reduced a number it had
+            // not, with nothing to separate that from the case where it really had.
+            val asked = heapOverrideAskedMb
+            val ceilingSource = when {
+                asked == null -> "derived from device RAM"
+                asked == heapMb -> "user override"
+                else -> "user override of ${asked}MB, clamped"
+            }
+            val summary =
+                "Server process started with PID ${getServerPid()}, heap ceiling ${heapMb}MB " +
+                    "($ceilingSource)"
+            Logger.i(tag, summary)
+            // And said twice on purpose. A bug report carries `server.log`, which
+            // only [ServerLog] writes, while `Logger.i` reaches logcat and in a
+            // release build stops there. Mirroring the one line makes the figure
+            // reachable from the report, next to the server output it explains.
+            // The output reader is already appending on its own thread by now;
+            // each append is a separate open in append mode, so the line lands
+            // whole either side of whatever the server has printed.
+            serverLog.append(summary)
+            true
+        } catch (e: Exception) {
+            Logger.e(tag, "Failed to start server", e)
+            // Mirrored into `server.log`, because this is the one failure that
+            // otherwise writes nothing to it. Every other line in that file comes
+            // from a process: the start summary above is written after the spawn,
+            // and [startOutputReader] drains a pipe that only exists once there is
+            // one. So a spawn that was refused left the file exactly as empty as a
+            // server that had nothing to say, and the two are the ones a reader
+            // most needs to tell apart. The message names the program and the
+            // errno, which is what says whether the binary is missing.
+            //
+            // The class name as well as the message, because `message` is null on
+            // plenty of throwables and the line would then read "Failed to start
+            // server: null", which names nothing and looks like a bug in this
+            // line rather than a report about the one above it.
+            serverLog.append("Failed to start server: ${e.javaClass.simpleName}: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Suspends until the server responds to a health check or the timeout elapses.
+     *
+     * Polls [probeReadiness] at [pollIntervalMs] intervals and answers with the
+     * outcome. The answer is the whole contract: there is no readiness callback
+     * here, because a suspending function that returns the result already told
+     * the caller, and the one that used to sit here was assigned by nobody.
+     *
+     * The budget is measured on [nanoClock] and not on the wall clock, which is
+     * the difference between a thirty-second poll and a poll that lasts thirty
+     * seconds of whatever the clock happens to say. The wall clock is corrected
+     * out from under a running app: NTP or NITZ lands as the network attaches,
+     * which is precisely when a first launch after a boot is inside this loop, and
+     * on a device whose RTC was materially wrong the step is large. Correcting
+     * forward ended the poll without another probe, correcting backward kept the
+     * launch coroutine in it long past the timeout, and the line below reported a
+     * figure that was neither. The counterpart loop for the same event,
+     * `NodeService.awaitLateReadiness`, has always used a monotonic source.
+     *
+     * @param timeoutMs  Maximum time to wait for the server to become ready.
+     * @param pollIntervalMs  Interval between health check attempts.
+     * @return `true` if the server became ready within the timeout.
+     */
+    suspend fun waitForReady(
+        timeoutMs: Long = READY_POLL_TIMEOUT_MS,
+        pollIntervalMs: Long = 200,
+    ): Boolean {
+        val startedAt = nanoClock()
+        while (elapsedMsSince(startedAt) < timeoutMs) {
+            if (probeReadiness()) {
+                Logger.i(tag, "Server ready after ${elapsedMsSince(startedAt)}ms")
+                return true
+            }
+            delay(pollIntervalMs)
+        }
+        Logger.e(tag, "Server failed to become ready within ${timeoutMs}ms")
+        return false
+    }
+
+    /** Milliseconds since a [nanoClock] reading. */
+    private fun elapsedMsSince(startNanos: Long): Long =
+        TimeUnit.NANOSECONDS.toMillis(nanoClock() - startNanos)
+
+    /**
+     * Whether the process holding our port is an editor server this app started.
+     *
+     * Answered from a note the bootstrap left, not by asking the port holder.
+     * That direction is the whole point, and the earlier version had it backwards:
+     * it built `http://127.0.0.1:$port/?tkn=<token>` and treated any answer other
+     * than 403 as proof of ownership. Two things were wrong with it, and the
+     * second follows from the first.
+     *
+     * It handed the connection token to whoever held the port. Binding a loopback
+     * port on Android needs no permission at all, so a process that has just taken
+     * the port from a killed server is precisely the party that must not be given
+     * the token, and it was given the token before anything about it was known.
+     * The doc claimed the opposite ("a process that accepts it either is one of
+     * ours or has read a file nothing outside this app can"), which is only true
+     * of a test that asks the holder to PRODUCE the token; this one presented it.
+     *
+     * And "not a refusal" is not a test. 200, 302, 404 and 500 all passed it, so
+     * anything that accepts a TCP connection and answers something was adopted,
+     * after which readiness is a bare 200 from `/version`, and the WebView is
+     * pointed at it with the bridge attached.
+     *
+     * So ownership is established where it is actually known. `assets/server.js`
+     * writes the pid of the editor server it forked, with the port, into
+     * app-private storage; this reads it back and checks the process is still
+     * alive and still that server. Nothing is sent anywhere, and a stranger cannot
+     * forge the answer, because the answer never leaves this app's own storage.
+     *
+     * Three ways this says no, all of them the safe direction: no note, a note for
+     * a different port, or a pid that is gone or is now some other program. Each
+     * falls through to the ordinary spawn, which is what happened before adoption
+     * existed.
+     *
+     * What it does NOT establish is that the recorded process is the one holding
+     * the socket, that would need /proc/net/tcp, which SELinux denies an app
+     * outright (measured: untrusted_app against proc_net_tcp_udp returns an empty
+     * mask). Nor does it establish that the recorded process ever held it: the
+     * note is written at the fork, before the child has had the chance to listen
+     * and whether or not it ever will.
+     *
+     * So this answers one question of the two, and [recordedServerIsServing]
+     * answers the other before [startServer] adopts anything. This doc used to
+     * end by calling the gap narrow and saying [startAdoptionWatch] caught what
+     * fell through it; the watch does notice, and noticing is not catching,
+     * it reports the server lost, the restart adopts the same note again, and the
+     * budget is spent on a loop. Neither question is sufficient alone.
+     */
+    fun portHeldByOurEditorServer(): Boolean {
+        val note = File(Environment.getServerDir(context), EDITOR_PID_FILE)
+        val recorded = try {
+            if (!note.isFile) return false
+            JSONObject(note.readText())
+        } catch (e: Exception) {
+            Logger.w(tag, "Could not read the editor server note: ${e.message}")
+            return false
+        }
+
+        val pid = recorded.optInt("pid", 0)
+        val port = recorded.optInt("port", 0)
+        if (pid <= 0 || port != _port) {
+            Logger.i(tag, "Editor server note does not describe port $_port; not adopting")
+            return false
+        }
+
+        // /proc/<pid> is readable for this app's own processes, the same access
+        // process-monitor.js already relies on, and unreadable for anyone
+        // else's, so a pid that has been recycled into another app's process
+        // reads as absent rather than as a match.
+        val cmdline = try {
+            File(File(procDir, pid.toString()), "cmdline").takeIf { it.isFile }?.readText()
+        } catch (e: Exception) {
+            null
+        }
+        if (cmdline == null) {
+            Logger.i(tag, "Editor server $pid is gone; not adopting port $_port")
+            return false
+        }
+
+        // The kernel separates argv with NULs; substring matching over the raw
+        // bytes is enough and avoids caring how many arguments there are.
+        val isOurServer = cmdline.contains(EDITOR_ENTRY_POINT)
+        if (!isOurServer) {
+            Logger.w(tag, "Pid $pid is no longer an editor server; not adopting port $_port")
+        }
+        return isOurServer
+    }
+
+    /**
+     * Ends the editor server the note names, when it is still one of ours.
+     *
+     * The gap this closes: `assets/server.js` forwards SIGTERM to the editor server it
+     * forked, but a SIGKILLed bootstrap forwards nothing and `fork()` sets no PDEATHSIG,
+     * so the child outlives its parent. [stopServer] cannot end that one, because it holds
+     * a `Process` handle only for a child it spawned itself. The survivor then keeps its
+     * heap for the life of the app and counts against the 32-process limit
+     * `assets/process-monitor.js` exists to stay under.
+     *
+     * Killing by a recorded pid has an obvious hazard: pids are recycled, so the process
+     * at that number may no longer be the one the note described. Three things bound it,
+     * and the first is doing most of the work:
+     *
+     *  - **The kernel refuses across uids.** `kill(2)` needs a matching uid, and every
+     *    other app on the device runs as a different one, so a pid recycled outside this
+     *    app cannot be killed here at all: the call fails rather than hitting a stranger.
+     *    What remains reachable is this app's own processes, which is a much smaller set.
+     *  - **The cmdline is re-read immediately before the signal**, so a pid recycled into
+     *    one of our terminals or a language server does not match [EDITOR_ENTRY_POINT] and
+     *    is left alone. The window between that read and the signal is what cannot be
+     *    closed from userspace; it is microseconds wide and needs a recycle landing inside
+     *    it onto another editor server of ours.
+     *  - **The note is consumed either way**, so a pid this declines to kill is not
+     *    reconsidered on the next call.
+     *
+     * A captured note also requires the same run identity in the process environment;
+     * a replaced note or unreadable identity is left untouched.
+     *
+     * @return whether a process was signalled. False covers no note, a note for another
+     *   port, a pid already gone, and a pid that is no longer an editor server.
+     */
+    internal fun reapRecordedEditorServer(reason: String, capturedNote: String? = null): Boolean {
+        val note = File(Environment.getServerDir(context), EDITOR_PID_FILE)
+        val recorded = try {
+            if (!note.isFile) return false
+            val contents = note.readText()
+            if (capturedNote != null && contents != capturedNote) return false
+            JSONObject(contents)
+        } catch (e: Exception) {
+            Logger.w(tag, "Could not read the editor server note: ${e.message}")
+            return false
+        }
+        val pid = recorded.optInt("pid", 0)
+        val port = recorded.optInt("port", 0)
+        if (pid <= 0 || port != _port) return false
+        if (capturedNote != null) {
+            val owner = recorded.optString("runId", "")
+            val environment = try {
+                File(File(procDir, pid.toString()), "environ").readText()
+            } catch (_: Exception) {
+                Logger.w(tag, "Could not verify editor server $pid ownership; leaving it alone ($reason)")
+                return false
+            }
+            if (owner.isEmpty() || "VSCODROID_SERVER_RUN_ID=$owner" !in environment.split('\u0000')) {
+                return false
+            }
+        }
+
+        // Deliberately the last thing before the signal. Re-reading here rather than
+        // trusting the check adoption already made is the whole mitigation: that one may
+        // be minutes old, and this one is the only thing standing between a recycled pid
+        // and a process of ours that has nothing to do with the editor.
+        val cmdline = try {
+            File(File(procDir, pid.toString()), "cmdline").takeIf { it.isFile }?.readText()
+        } catch (e: Exception) {
+            null
+        }
+        if (capturedNote != null && runCatching { note.readText() }.getOrNull() != capturedNote) return false
+        note.delete()
+        if (cmdline == null) {
+            Logger.i(tag, "Editor server $pid is already gone; nothing to reap ($reason)")
+            return false
+        }
+        if (!cmdline.contains(EDITOR_ENTRY_POINT)) {
+            Logger.w(tag, "Pid $pid is no longer an editor server; leaving it alone ($reason)")
+            return false
+        }
+        return try {
+            killRecordedProcess(pid)
+            Logger.i(tag, "Ended the editor server $pid still holding port $_port ($reason)")
+            true
+        } catch (e: Exception) {
+            Logger.w(tag, "Could not end the editor server $pid: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Whether the port a reap has just signalled for is free yet, given a moment.
+     *
+     * The reason this is a short poll rather than one question: a kill returns
+     * when the signal is QUEUED. `android.os.Process.killProcess` is `kill(2)`
+     * underneath, and the kernel closes the dead process's listening socket while
+     * it runs `do_exit` afterwards, which for a Node process with a large
+     * descriptor table is not instantaneous. The single bind test that stood here
+     * ran microseconds later, on the same thread, so it was likely to still read
+     * held, and the flag it fed says "this spawn can never serve" -- which is what
+     * turns a start that is merely slow into `LaunchOutcome.CANNOT_BIND`, kills
+     * the healthy server it spawned and spends a restart on it.
+     *
+     * Bounded rather than patient: the whole grace is paid only when a reap ran,
+     * only while the socket is still held, and returns at the first free answer,
+     * so the ordinary reap pays one bind test and a few milliseconds. A holder the
+     * reap never touched -- a foreign process that took the port while the
+     * recorded child wedged on EADDRINUSE -- still reads held at the end of it,
+     * which is the case the flag exists for and the reason the grace is short
+     * enough to be spent rather than long enough to matter.
+     *
+     * What a true answer here decides is two things, neither of them the
+     * credential: on a cold start, whether the remembered port is kept or
+     * abandoned to the allocator (see the reap in [startServer]); and on every
+     * start, the verdict the service reads when the start poll gives up,
+     * CANNOT_BIND against merely slow. It no longer decides who may be handed
+     * the connection token: [probeReadiness] waits for
+     * the spawned process itself to report its listen whether the port read held
+     * or free at the spawn, so a reap that frees the port, and a reap that only
+     * looked as if it had, both end up trusting the same evidence. An earlier
+     * shape hung a commit check on [spawnedOntoHeldPort] alone, which made this
+     * grace a security decision as well as a diagnostic one.
+     */
+    private fun portFreedByReap(): Boolean {
+        var waited = 0L
+        while (true) {
+            if (PortFinder.isPortAvailable(_port)) return true
+            if (waited >= REAP_PORT_RELEASE_GRACE_MS) return false
+            try {
+                Thread.sleep(REAP_PORT_POLL_MS)
+            } catch (e: InterruptedException) {
+                // A stop landing inside the grace. Nothing here is worth holding
+                // the interrupt for, and the honest answer for a port that has
+                // not been seen free is that it is not.
+                Thread.currentThread().interrupt()
+                return false
+            }
+            waited += REAP_PORT_POLL_MS
+        }
+    }
+
+    /**
+     * Whether the port is answering, and answering as this build.
+     *
+     * The second half of the adoption test, and it is not a restatement of the
+     * first. [portHeldByOurEditorServer] proves the recorded process is alive and
+     * is still an editor server of ours; nothing in the note says it ever bound
+     * the port, because `assets/server.js` writes it at the fork.
+     *
+     * That gap has a process that fits it exactly. A server spawned onto a port
+     * something else holds prints `EADDRINUSE` and then does not exit, measured
+     * on an API 36 emulator, same pids at 0, 5, 15, 30 and 60 seconds, so a
+     * bootstrap SIGKILLed by the OOM killer or the phantom-process limit, which
+     * is the case adoption exists for, can leave behind a child that is alive,
+     * is an editor server, matches the note, and has never held the port. Adopting
+     * it produces a session that never answers: [startAdoptionWatch] calls it lost
+     * after two missed probes, the restart reads the same note and adopts the same
+     * process, and five rounds later the app is in the terminal state having never
+     * attempted the spawn that would have worked. Nothing clears that note, so it
+     * survives cold starts too, for as long as the orphan does.
+     *
+     * Asking the port is safe in the way the ownership test that preceded it was
+     * not: `/version` is answered before the connection-token check, so the probe
+     * carries no token and discloses nothing to whoever is on the other end. That
+     * direction is not negotiable. The credential is what the WebView is about to
+     * carry to this port, and handing it to the party the test exists to identify
+     * is the mistake that was taken out of here once already.
+     *
+     * What the port is asked for is its identity, not merely a status line. The
+     * route answers `productService.commit` as `text/plain`, so a holder that is
+     * this build's editor server returns the commit
+     * `<server-dir>/vscode-reh/product.json` records, and one that is not returns
+     * something else, or nothing, or 403. A bare 200 was the whole test until now,
+     * which every process that accepts a connection and answers anything at all
+     * satisfies, and binding a loopback port on Android needs no permission.
+     *
+     * Read what this does and does not settle, because the difference decides
+     * what may be built on it. It settles which VS Code source the holder was
+     * built from, and no more than that: the value is `microsoft/vscode`'s tag SHA
+     * for the pinned version, the same one the tracked `VSCODE_COMMIT` file
+     * records, so every VSCodroid build at that pin answers identically and the
+     * value is app-private in no sense at all. That excludes an ordinary stranger
+     * on the port, which is what adoption needs, and nothing stronger may be built
+     * on it: it does not tell two builds of this app apart. It does NOT settle
+     * that the holder is the recorded pid either: the commit is public, so a
+     * process written to imitate this app can answer it, and attributing a socket
+     * to a pid would need the `/proc/net/tcp` read SELinux refuses an app
+     * outright. The two halves therefore still narrow rather than prove, and the
+     * note stays the ownership half.
+     *
+     * Refusing here is not the end of the recorded server, but the reap that
+     * follows in [startServer] is: a holder of ours that was merely slow to
+     * answer is ended and replaced on the same port rather than adopted by a
+     * later attempt. Being wrong in this direction therefore costs one server
+     * start, a few seconds of a launch the user is already waiting on; being
+     * wrong in the other costs the session.
+     */
+    private fun recordedServerIsServing(): Boolean {
+        // Answered first, because a build that cannot say what it is cannot
+        // recognise itself on a port either. That is the fail-closed direction:
+        // adoption is an optimisation, and declining it costs a spawn.
+        val expected = bundledServerCommit()
+        if (expected == null) {
+            Logger.w(
+                tag,
+                "The packaged server records no commit, so nothing answering on port " +
+                    "$_port can be identified as this build; spawning rather than adopting",
+            )
+            return false
+        }
+
+        val served = probeVersion()
+        if (served == null) {
+            Logger.w(
+                tag,
+                "An editor server of ours is recorded on port $_port but nothing is " +
+                    "answering there; spawning rather than adopting it",
+            )
+            return false
+        }
+        if (served != expected) {
+            Logger.w(
+                tag,
+                "Port $_port is held by something reporting \"$served\" rather than this " +
+                    "build's $expected; spawning rather than adopting it",
+            )
+            return false
+        }
+        return true
+    }
+
+    /**
+     * The commit the packaged server tree was built from, or null if it does not
+     * say.
+     *
+     * The same file the server itself answers `/version` from: `server.js`
+     * rewrites `product.json` on every start, but its overrides do not include
+     * `commit`, so what is on disk is what the running server reports.
+     *
+     * Null covers an absent file, unreadable JSON, and a tree built without a
+     * commit. All three mean the same thing here, that this build cannot be told
+     * apart from anything else, and all three decline adoption rather than falling
+     * back to accepting whoever answers.
+     */
+    private fun bundledServerCommit(): String? = try {
+        File(Environment.getServerDir(context), REH_PRODUCT_FILE)
+            .takeIf { it.isFile }
+            ?.let { JSONObject(it.readText()).optString("commit") }
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+    } catch (e: Exception) {
+        Logger.w(tag, "Could not read the packaged server's commit: ${e.message}")
+        null
+    }
+
+    /**
+     * Whether `http://127.0.0.1:{port}/version` answers 200.
+     *
+     * `/version` is answered before the connection-token check: the server handles
+     * it and returns, then gates everything else, so this stays a pure liveness
+     * probe and does not need the token.
+     *
+     * It also has to be `/version` rather than `/`. This accepted anything below
+     * 500, which was fine while every route answered 200, and became wrong the
+     * moment the server started requiring a token: `/` then answers 403, and a
+     * readiness check that counts 403 as healthy reports a successful startup for
+     * a server that will serve the user nothing but Forbidden.
+     *
+     * Liveness only, deliberately, which is what [startAdoptionWatch] wants of a
+     * heartbeat over a server whose identity was settled when it was adopted.
+     * Which build answered is [probeVersion]'s business, and only adoption asks
+     * it; [probeReadiness] settles ownership from the spawned process's own
+     * output instead. An ordinary readiness poll runs every 200 ms for thirty
+     * seconds and has no use for the answer.
+     */
+    fun isServerHealthy(): Boolean = probeVersion() != null
+
+    /**
+     * What `/version` answers, or null if the port did not answer 200.
+     *
+     * One request serves both questions the class asks of the port. Liveness only
+     * needs the status, so [isServerHealthy] discards the body; adoption needs to
+     * know which build answered, and reading it costs one more read on a socket
+     * that is already open.
+     *
+     * The body is taken up to [VERSION_BODY_MAX_CHARS] and no further. The read
+     * timeout bounds each read rather than the total, so an unbounded reader would
+     * let whatever holds the port keep this thread as long as it kept sending, and
+     * the point of the call is that the holder may be a stranger.
+     */
+    private fun probeVersion(): String? = try {
+        val connection = (URL("http://127.0.0.1:$_port/version").openConnection()
+            as HttpURLConnection).apply {
+            connectTimeout = 1000
+            readTimeout = 1000
+            requestMethod = "GET"
+            instanceFollowRedirects = false
+        }
+        try {
+            if (connection.responseCode == 200) {
+                connection.inputStream.reader().use { readBounded(it) }
+            } else {
+                null
+            }
+        } finally {
+            connection.disconnect()
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun readBounded(reader: Reader): String {
+        val buffer = CharArray(VERSION_BODY_MAX_CHARS)
+        var filled = 0
+        while (filled < buffer.size) {
+            val read = reader.read(buffer, filled, buffer.size - filled)
+            if (read < 0) break
+            filled += read
+        }
+        return String(buffer, 0, filled).trim()
+    }
+
+    /**
+     * Stops the server, waiting briefly for it to go before killing it.
+     *
+     * [isShuttingDown] is set first, and that is what keeps [startWatchdog]
+     * quiet: the exit that follows is expected, so no crash callback fires and
+     * nothing restarts the server behind this call. It was the one thing a
+     * second, older copy of this documentation said that this one did not.
+     *
+     * The wait is short because it is paid on whichever thread calls this, and
+     * the Stop action on the notification calls it from Service.onDestroy --
+     * the main thread. A five-second wait there does not trip the service ANR
+     * timeout, which is far longer, but the main thread is shared: any input
+     * dispatched behind it waits too, and that timeout is five seconds. The
+     * freeze users reported is input starving, not the service stalling.
+     *
+     * It is not moved to a background thread, and that is deliberate. Android
+     * will not kill the process while a lifecycle callback is running, so
+     * waiting here is what keeps [killBootstrap] reachable. Hand the
+     * wait to another thread and a process killed the moment onDestroy returns
+     * leaves Node reparented to init and still running -- trading a freeze for
+     * an orphan, which is worse and much harder to notice.
+     *
+     * A second is enough because it is not the real mechanism: server.js
+     * forwards SIGTERM to the editor server it forked (its own SIGTERM handler),
+     * so a healthy shutdown finishes in milliseconds. The budget exists for a
+     * server that has stopped responding to signals, and for that case the
+     * forcible kill below is the answer rather than a longer wait.
+     *
+     * And the forcible kill reaches the bootstrap ONLY, which is what the reap
+     * below it is for. [killBootstrap] ends it with a SIGKILL, which is not forwarded,
+     * and `fork()` sets no PDEATHSIG, so an editor server nothing else signalled
+     * outlives the stop still holding the port. Nothing clears the note naming it
+     * either, because `assets/server.js` deletes that from the child's exit
+     * handler: the state the stop leaves is exactly the orphan the adoption branch
+     * of [startServer] exists for.
+     *
+     * A backstop, not the usual path, and reading it as the mechanism overstates
+     * what it does. The SIGTERM above is answered by `assets/server.js`, whose
+     * handler forwards it to the child and SIGKILLs that child
+     * CHILD_KILL_AFTER_SIGTERM_MS later, well inside the budget here, so an
+     * ordinary stop has already ended the editor server before the wait returns.
+     * A bootstrap already dead before Stop also needs the backstop: its wait can
+     * succeed while its editor child is still alive.
+     */
+    fun stopServer() {
+        val (stoppingProcess, stoppingRunId, stoppingWatchdog) = synchronized(readinessLock) {
+            isShuttingDown = true
+            clearReadiness()
+            Triple(serverProcess, serverRunId, watchdogThread)
+        }
+        // Nothing of ours is running with the user's number after this, so a crash
+        // report still on its way to the service must not be charged against it.
+        heapOverrideActive = false
+        // And the suspension with it, because the card that reports it is built
+        // BEFORE the spawn that would derive it: `NodeService.onStartCommand`
+        // promotes to the foreground to decide whether to serve at all, so the
+        // first card of a start carries whatever the previous one left here.
+        // Cleared at the stop, a start after one reports nothing until
+        // `announceReady` rebuilds the card from a value this start actually read.
+        heapOverrideSuspendedNow = false
+        if (adopted) {
+            // No `Process` handle exists for a server this class did not spawn, which is
+            // why this used to be a log line saying the stop could not end it. The note
+            // the bootstrap wrote is the way in: it names the pid, and killing by pid is
+            // what [reapRecordedEditorServer] bounds. Leaving it running cost an idle Node
+            // process for the life of the app, holding its heap and one of the 32 slots
+            // the phantom-process limit allows.
+            //
+            // Still reported when it cannot be ended, because that outcome has not gone
+            // away: a note that has been consumed, a pid already recycled, or a kill the
+            // kernel refuses all land here, and a silent return would leave the caller
+            // believing the stop succeeded.
+            if (!reapRecordedEditorServer("service stopping")) {
+                Logger.w(
+                    tag,
+                    "The server on port $_port was adopted, not started here, and could " +
+                        "not be ended from its recorded pid. It keeps running until the " +
+                        "system reclaims it.",
+                )
+            }
+            adopted = false
+        }
+        Logger.i(tag, "Stopping server...")
+        stoppingProcess?.let { process ->
+            // Capture ownership before signalling; a later note may name a replacement.
+            val capturedNote = try {
+                File(Environment.getServerDir(context), EDITOR_PID_FILE).readText().takeIf {
+                    stoppingRunId != null && JSONObject(it).optString("runId", "") == stoppingRunId
+                }
+            } catch (_: Exception) {
+                null
+            }
+            val wasAlive = process.isAlive
+            var bootstrapExited = false
+            try {
+                process.destroy()
+                val exited = process.waitFor(GRACEFUL_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                if (exited) {
+                    bootstrapExited = true
+                    Logger.i(tag, "Server stopped with exit code ${process.exitValue()}")
+                } else {
+                    Logger.w(tag, "Graceful shutdown timed out, force killing")
+                    killBootstrap(process)
+                }
+            } catch (e: Exception) {
+                Logger.w(tag, "Shutdown failed, force killing", e)
+                killBootstrap(process)
+            }
+            // A wait on an already dead bootstrap says nothing about its child's exit.
+            if ((!wasAlive || !bootstrapExited) && capturedNote != null) {
+                if (!reapRecordedEditorServer("its bootstrap could not stop it", capturedNote)) {
+                    Logger.w(tag, "The recorded editor server could not be ended for this stop")
+                }
+            }
+        }
+        synchronized(readinessLock) {
+            if (serverProcess === stoppingProcess && serverRunId == stoppingRunId) {
+                serverProcess = null
+                serverRunId = null
+            }
+            if (watchdogThread === stoppingWatchdog) watchdogThread = null
+        }
+        stoppingWatchdog?.interrupt()
+    }
+
+    /**
+     * Ends a bootstrap that did not leave on the SIGTERM [Process.destroy] sent.
+     *
+     * On Android [Process.destroyForcibly] is [Process.destroy] again, a second SIGTERM,
+     * and a bootstrap whose event loop has stopped answering signals survives both, so the
+     * SIGKILL goes by pid. A pid that cannot be read, or a process that has gone since,
+     * leaves it at the SIGTERM; a pid of 0 or below would signal a whole process group.
+     */
+    private fun killBootstrap(process: Process) {
+        process.destroyForcibly()
+        val pid = pidOf(process)?.takeIf { it > 0 && process.isAlive } ?: return
+        killRecordedProcess(pid.toInt())
+    }
+
+    /**
+     * The V8 heap ceiling for this device.
+     *
+     * Reading the device is the point: the flag was a literal 512 regardless of
+     * whether the phone had 2 GB or 16 GB. On a small device that left no
+     * headroom -- the flag caps the V8 heap, not process RSS, so the native
+     * heap, ICU data and loaded addons all sit outside it, and what actually
+     * ends the process is Android's low-memory killer, which does not read
+     * flags. On a large device the extra RAM went unused.
+     *
+     * It reaches the worker hosts as well, which is worth writing down because
+     * the code invites the opposite conclusion: the flag is on the command line
+     * of the main isolate only, while the Extension Host and the Pty Host run as
+     * `worker_threads` Workers, so handing it to them as a Worker resource limit
+     * looks like a missing step. It is not one, twice over. Measured on Node
+     * 22.17.1, which is a major behind the runtime that ships here:
+     * `--max-old-space-size` is applied process-wide in V8, so a Worker created
+     * with no resource limits at all still died at the ceiling, and a Worker given
+     * an explicit, smaller limit ran past it to the ceiling instead, because the
+     * command-line flag overrides `resourceLimits` rather than the other way
+     * round. Separately, `fork()` passes the parent's `execArgv` on by default,
+     * so the flag is already in `process.execArgv` at both places a host Worker
+     * is created, and `workerAsChildProcess.ts` turns it into a resource limit
+     * there. Adding a pass-through would change no number.
+     *
+     * READ THE PARAGRAPH ABOVE AS "EACH ISOLATE IS CAPPED AT THIS NUMBER", NOT AS
+     * "THE ISOLATES SHARE ONE HEAP OF THIS SIZE". The word process-wide is about
+     * where the flag applies, not about what is being divided, and taking it the
+     * other way is what makes the arithmetic invisible: a Worker dying AT the
+     * ceiling rather than at the ceiling minus what the main isolate already held
+     * is what a per-isolate limit looks like. So the number MULTIPLIES rather than
+     * divides. Today's 768 authorises about 768 in the bootstrap isolate, 768 in
+     * the editor server's main isolate, 768 in the Extension Host worker, 768 in
+     * the Pty Host worker and 768 in the still-forked file watcher. The forked
+     * agent host would be a sixth; patch 0020 keeps it from starting on Android.
+     * Anyone raising this number is taking a larger step than it looks, which is
+     * the reason [heapOverrideMaxMb] is as conservative as it is.
+     *
+     * NOT THE LARGEST V8 HEAP ON THE DEVICE, and this is the other thing the
+     * number invites a reader to assume. `typescript-language-features` builds
+     * tsserver's own `--max-old-space-size` from `tsserver.maxMemory`, whose
+     * upstream default is 3072 with no reference to device RAM, and tsserver is
+     * forked by the Extension Host so nothing here is on its path. On a 4 GB phone
+     * the editor server gets 462 MB from this function while one language server
+     * gets 3072. Whether that number should be clamped, pinned or left is a
+     * product decision and not settled here; it is written down so the next reader
+     * does not conclude this function bounds the device.
+     */
+    private fun heapCeilingForDevice(): Int = try {
+        val am = context.getSystemService(ActivityManager::class.java)
+        val info = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
+        val totalMb = info.totalMem / 1_048_576
+        val requested = requestedHeapCeiling(totalMb, am.isLowRamDevice)
+        heapOverrideAskedMb = requested?.takeIf {
+            heapOverrideHonoured(totalMb, am.isLowRamDevice, it)
+        }
+        // "was it taken and was it larger", not "was one present". See
+        // [heapOverrideHonoured] for the first half and [heapOverrideRaisesCeiling]
+        // for the second; the flag decides whose budget the next kill spends, and
+        // both halves have to hold before it is the user's.
+        heapOverrideActive = heapOverrideRaisesCeiling(totalMb, am.isLowRamDevice, requested)
+        heapCeilingMb(totalMb, am.isLowRamDevice, requested)
+    } catch (e: Exception) {
+        // Reading it is not worth failing a start over, and the old literal is
+        // the right thing to fall back to: it is what every device ran until now.
+        heapOverrideActive = false
+        heapOverrideAskedMb = null
+        // Nothing was read, so nothing was suspended. Cleared alongside the two
+        // above rather than left, for the reason they are: this instance survives
+        // every restart, and a value carried over from an earlier start is not
+        // about this one.
+        heapOverrideSuspendedNow = false
+        Logger.w(tag, "Could not read device memory, using the default ceiling: ${e.message}")
+        HEAP_CEILING_DEFAULT_MB
+    }
+
+    /**
+     * The ceiling the user has asked for, or null when there is none to honour.
+     *
+     * Read on every [startServer] rather than cached, and that placement is not an
+     * accident: [ProcessManager] is constructed once in `NodeService.onCreate` and
+     * lives for the whole service, which spans every crash restart, so a value
+     * resolved in a field initialiser or a constructor would be frozen for longer
+     * than the user would ever guess.
+     *
+     * Returns null in four cases that are deliberately not distinguished here,
+     * because the answer to all four is the derived ceiling: no settings file, no
+     * key in it, a value that is not a bare integer, and a value whose budget of
+     * [HEAP_OVERRIDE_KILL_BUDGET] SIGKILLs is spent.
+     *
+     * The latch is consulted only for a request that RAISES the ceiling, which is
+     * why this needs the device's numbers. Suspending a request that lowered it
+     * would hand the device back a ceiling twice the size of the one the user
+     * chose precisely because it was being killed, and it would do it on the
+     * strength of kills the user's value cannot have caused. A device that already
+     * carries a count recorded against a lowered value therefore finds that value
+     * honoured again on the next start, rather than staying suspended over a count
+     * nothing would ever add to.
+     *
+     * The write side of the latch lives here rather than beside the counter for a
+     * reason worth keeping: recording the value SEEN at the moment it is honoured
+     * is what lets [heapKillsForValue] tell a value that has been killing this
+     * device from one the user has since changed. Written with `commit()` and not
+     * `apply()`, on IO where this already runs, because the very next thing this
+     * record has to survive is a SIGKILL of this app's process, and `apply()`'s
+     * deferred write can lose that race.
+     */
+    // Lint does not hold the commit the KDoc asks for. ApplySharedPref flags a
+    // call to `Editor.commit()`, not the KTX `edit(commit = true)` written here;
+    // `the count is committed rather than deferred` guards this writer and
+    // NodeService's.
+    private fun requestedHeapCeiling(totalRamMb: Long, isLowRam: Boolean): Int? = try {
+        // Answered here because this is where the suspension is actually decided,
+        // and re-answered on every start so that it cannot go stale: a user who
+        // edits the value gets a fresh count from [heapKillsForValue] and this
+        // falls back to false on its own. See [heapOverrideIgnored] for who reads
+        // it and why a value the user set has to be visible somewhere that
+        // outlives a toast.
+        heapOverrideSuspendedNow = false
+        val settings = File(Environment.getMachineSettingsPath(context))
+        val asked = settings.takeIf { it.isFile }?.let { heapOverrideFromSettings(it.readText()) }
+        if (asked == null) null else if (!heapOverrideRaisesCeiling(totalRamMb, isLowRam, asked)) {
+            // Nothing to charge and nothing to suspend. A device that ignores the
+            // request never ran with it, and a request that lowers the ceiling
+            // cannot be what a low-memory kill is about, so neither one touches
+            // the record kept for a value that can.
+            asked
+        } else {
+            val prefs = context.getSharedPreferences(HEAP_PREFS_NAME, Context.MODE_PRIVATE)
+            val kills = heapKillsForValue(
+                prefs.getInt(PREF_HEAP_VALUE_SEEN, 0), prefs.getInt(PREF_HEAP_KILLS, 0), asked
+            )
+            prefs.edit(commit = true) { putInt(PREF_HEAP_VALUE_SEEN, asked).putInt(PREF_HEAP_KILLS, kills) }
+            if (heapOverrideSuspended(kills)) {
+                heapOverrideSuspendedNow = true
+                Logger.w(
+                    tag,
+                    "The heap ceiling of ${asked}MB in settings.json was followed by $kills " +
+                        "kills and is being ignored; change the value to try it again",
+                )
+                null
+            } else asked
+        }
+    } catch (e: Exception) {
+        // A settings file that cannot be read is not a reason to refuse a start.
+        // The derived ceiling is what the device ran before the key existed.
+        Logger.w(tag, "Could not read the heap ceiling from settings: ${e.message}")
+        null
+    }
+
+    /**
+     * Returns the PID of the running server process, or `null` if not running.
+     */
+    fun getServerPid(): Long? = serverProcess?.let { pidOf(it) }
+
+    /** The pid of [process], or null where the runtime does not give it up. */
+    private fun pidOf(process: Process): Long? {
+        return try {
+            // Prefer the public Java 9+ Process.pid() method when available.
+            val pidMethod = process.javaClass.methods.firstOrNull {
+                it.name == "pid" && it.parameterCount == 0
+            }
+            if (pidMethod != null) {
+                (pidMethod.invoke(process) as? Long)
+            } else {
+                // Fallback for runtimes that only expose an internal pid field.
+                // This is the branch Android takes up to API 36: its java.lang.Process
+                // has no pid() there. On a desktop JVM the method is found but
+                // belongs to the package-private ProcessImpl, so invoking it fails
+                // and this returns null; do not assert on it from a JVM unit test.
+                val pidField = process.javaClass.getDeclaredField("pid")
+                pidField.isAccessible = true
+                pidField.getInt(process).toLong()
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Whether the process this instance spawned is alive.
+     *
+     * The process and only the process, which is narrower than the name reads. An
+     * adopted server has none, so this answers false for one that is serving
+     * perfectly well; [hasLiveServer] is the question a caller deciding whether
+     * anything is still there means to ask, and [isReady] is the one a caller
+     * deciding whether to navigate means to ask.
+     */
+    fun isRunning(): Boolean = serverProcess?.isAlive == true
+
+    /**
+     * Whether the server has answered a health check and has not stopped since.
+     *
+     * Not the same question as [isRunning], and the gap between them is wide
+     * enough to have shipped a bug. `isRunning` asks whether a process exists;
+     * this asks whether the thing inside it is serving. Between the two lies
+     * every start (the process is spawned in milliseconds and the editor server
+     * it forks takes seconds to bind its port) and every restart after a crash.
+     * A caller that navigates a WebView on `isRunning` therefore points it at a
+     * port with nothing listening, and gets a connection-refused page.
+     *
+     * The answer costs nothing to read, which is the other half of why this
+     * exists. [isServerHealthy] is the real probe and it blocks on HTTP, so it
+     * cannot be called from the main thread; that constraint is what pushed the
+     * navigation decision onto `isRunning` in the first place. Recording the
+     * probe's own result where it already runs gives the main thread the true
+     * answer without the I/O.
+     *
+     * Set by [probeReadiness] and withdrawn only through [clearReadiness], which
+     * [startServer], [stopServer], the watchdog when the process exits and the
+     * adoption watch when the server it found stops answering all call. It is deliberately not re-derived on read:
+     * a server that was serving a moment ago and has since died clears this
+     * through the watchdog, not through a fresh probe nobody on the main thread
+     * is in a position to run.
+     *
+     * That leaves a window worth naming rather than implying away. Between the
+     * process dying and the watchdog's `waitFor()` returning, this still answers
+     * true while the port is already dead. It is the gap between two statements
+     * rather than anything the app waits on (before this flag existed the same
+     * caller was wrong for the whole of a restart, so the window shrank by
+     * several orders of magnitude), but it did not close, and a caller that must
+     * not be wrong even briefly wants [probeReadiness] instead.
+     */
+    fun isReady(): Boolean = _isReady
+
+    /**
+     * Withdraws readiness, and with it any probe that is still asking.
+     *
+     * Every clear goes through here rather than writing the flag directly, and
+     * that is the whole rule: a probe blocks for a couple of seconds and cannot
+     * be cancelled, so a clear that only wrote the flag would be overwritten by
+     * a probe that started before it and finished after it. Bumping the epoch
+     * first is what makes the write below the one that stands. See
+     * [readinessEpoch].
+     *
+     * This is the only place `_isReady` is ever set false, and [probeReadiness]
+     * is the only place it is ever set true; both writes are inside
+     * [readinessLock]. A probe that loses the epoch comparison writes nothing at
+     * all rather than withdrawing anything, which is why nothing else needs to
+     * bump the epoch. A new clear site belongs here, not beside the flag.
+     */
+    private fun clearReadiness() {
+        synchronized(readinessLock) {
+            readinessEpoch.incrementAndGet()
+            _isReady = false
+        }
+    }
+
+    /**
+     * Asks the server once, and records the answer if it is yes.
+     *
+     * Blocking: it is [probeVersion] underneath, the same request [isServerHealthy]
+     * makes, so it belongs off the main thread like every other caller of that.
+     * Blocking also means cancellation does not reach it: a coroutine cancelled
+     * while this is in flight cannot act on the result, because it resumes by
+     * throwing, but the request itself runs to completion. The ceiling on that is
+     * the connect and read timeouts, a little over two seconds, and it is worth
+     * knowing rather than rediscovering.
+     *
+     * The single place `_isReady` is ever set true, which is the point of it
+     * existing rather than being written inline in [waitForReady]. [waitForReady]
+     * is a *bounded* poll, and something has to keep asking after that bound is
+     * spent: a server the poll gave up on is not a server that failed, and it can
+     * still bind its port a second later. When the only writer lived inside the
+     * bounded loop, that second later was unreachable: the flag stayed false for
+     * as long as the process lived, and every caller reading it refused a server
+     * that was serving perfectly well.
+     *
+     * Being that single writer is why the ownership question below is asked here
+     * and not in [isServerHealthy]: this answer is what points the WebView at the
+     * port, and `MainActivity` builds that URL with the connection token in it.
+     * [isServerHealthy] stays the plain liveness probe its own documentation
+     * describes, which is what [startAdoptionWatch] wants of it.
+     */
+    fun probeReadiness(): Boolean {
+        // Read before the request goes out, so the comparison at the foot of this
+        // function covers the whole of it.
+        val epoch = readinessEpoch.get()
+        val served = probeVersion() ?: return false
+        // A port answering is not a server of ours answering. Binding a loopback
+        // port on Android needs no permission, and readiness is what navigates:
+        // the URL `MainActivity` builds carries the credential that authenticates
+        // every route of the editor server, so whoever is believed here is handed
+        // it. The guard that stood here asked the holder which build it was, and
+        // that answered the wrong question twice over. The commit `/version`
+        // reports is microsoft/vscode's public tag SHA, [recordedServerIsServing]
+        // says so at length, so a process written to imitate this app passes it;
+        // and it was asked only on a start that recorded [spawnedOntoHeldPort], so
+        // a holder that took the port between the free check and the child's
+        // listen was never asked anything and passed on a bare 200.
+        //
+        // So the question is put to our own process instead. The editor server
+        // prints [SERVER_LISTENING_LINE] from its listen callback and from nowhere
+        // else, a child that lost the port prints EADDRINUSE and wedges, and
+        // [startOutputReader] clears [listenUnreported] on that line and on no
+        // other evidence. Until then the port's answer is somebody else's whatever
+        // it says. A start that never clears it ends the way a held port always
+        // has: the poll gives up and the service reads [spawnedOntoHeldPort].
+        //
+        // An adopted server spawned nothing and is exempt by construction; the
+        // note vouched for it before it was adopted. And a tree that records no
+        // commit is no longer refused here, which is the case the old guard had to
+        // confine itself to one path to avoid: the line does not depend on one.
+        if (listenUnreported) {
+            if (!unboundRefusalLogged) {
+                unboundRefusalLogged = true
+                Logger.w(
+                    tag,
+                    "Port $_port is answering as \"$served\", but the process this start " +
+                        "spawned has not reported binding it; not treating that as ready",
+                )
+            }
+            return false
+        }
+        // Checked and set as one step, which is the ordering and not a
+        // belt-and-braces re-read.
+        //
+        // [probeVersion] blocks for a little over two seconds at worst and the
+        // server can stop anywhere inside that window. An unguarded write would
+        // land AFTER the clear the watchdog or [stopServer] issued inside it, and
+        // [isReady] would answer true over a dead port until the next
+        // [startServer] clears it again -- a whole restart backoff away, two
+        // seconds at the first attempt. An activity binding inside that window
+        // navigates to a refused port, and `onReceivedError` only logs, so
+        // nothing takes that page away again.
+        //
+        // Writing first and validating afterwards was the earlier shape and it
+        // withdrew answers that were not its own to withdraw: see
+        // [readinessLock]. Under the lock a probe that lost simply never writes,
+        // so it can undo neither a clear nor a later probe. What it compares is
+        // the epoch and not liveness, and that difference is the whole of why
+        // this is safe to do here: liveness is not this function's question and
+        // never becomes it, a probe simply loses to any clear that happened
+        // while it was asking.
+        //
+        // The token is read here and stored in the same step. `/version`
+        // answering means the editor server has settled the token file, since
+        // every request waits for the server object whose construction reads or
+        // writes it. Under the same epoch, the value can neither outlive nor
+        // predate the readiness it belongs to; a lazy read in the getter could
+        // run after a new start's rotation and hand the next server's token to
+        // the port before that server is ready.
+        val token = readTokenFile()
+        synchronized(readinessLock) {
+            if (epoch != readinessEpoch.get()) return false
+            cachedToken = token
+            _isReady = true
+        }
+        return true
+    }
+
+    // -- Internal --
+
+    /**
+     * Starts a daemon thread that reads every line from the process stdout/stderr
+     * (merged via redirectErrorStream) and forwards it to [onServerOutput] and the
+     * debug log.
+     *
+     * It is also where [listenUnreported] is cleared, and that placement is the
+     * whole reason readiness may trust the flag: the line is read off a pipe only
+     * a process this class spawned can write to, so nothing on the port can forge
+     * it. Cleared before [onServerOutput] is invoked, so a consumer told about the
+     * line finds the flag already down.
+     */
+    private fun startOutputReader() {
+        val process = serverProcess ?: return
+        thread(name = "node-stdout", isDaemon = true) {
+            try {
+                BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+                    reader.lineSequence().forEach { line ->
+                        // Not a message: see [isSettingsProbeMiss].
+                        if (isSettingsProbeMiss(line)) return@forEach
+                        Logger.d(tag, "[node] $line")
+                        serverLog.append(line)
+                        // For the current process only. A restart replaces
+                        // `serverProcess` before it raises the flag again, so a
+                        // reader still draining the previous pipe cannot lower it
+                        // for a spawn it knows nothing about.
+                        if (line.contains(SERVER_LISTENING_LINE) && serverProcess === process) {
+                            listenUnreported = false
+                        }
+                        onServerOutput?.invoke(line)
+                    }
+                }
+            } catch (e: Exception) {
+                if (!isShuttingDown) {
+                    Logger.w(tag, "Output reader stopped", e)
+                }
+            }
+        }
+    }
+
+    /**
+     * Watches a server nobody here spawned.
+     *
+     * This is the whole answer to the objection that kept adoption out of the
+     * codebase: an adopted server has no [Process], so [startWatchdog]'s
+     * `waitFor()` has nothing to wait on, and its death would go unnoticed while
+     * this class reported it healthy forever. Trading a loud failure for a silent
+     * one is what the removal of the port refusal was avoiding, and adopting
+     * without this would have reintroduced it from the other side.
+     *
+     * Polling because there is nothing else available. The signal a `Process`
+     * gives for free has to be asked for here, and asking is what
+     * [isServerHealthy] already does.
+     *
+     * Two consecutive failures rather than one, because a single refused
+     * connection is not evidence of death, the same reasoning [probeReadiness]
+     * gives for not clearing readiness on one bad answer. The cost of being wrong
+     * in this direction is a restart the user did not need; in the other it is an
+     * editor that stopped working with nothing said.
+     *
+     * Reports through [onServerCrashed] rather than a channel of its own, so the
+     * recovery is the one that already exists. By the time it fires the port is
+     * free, so the restart it triggers spawns a real server rather than another
+     * one that cannot bind.
+     */
+    private fun startAdoptionWatch() {
+        val epoch = readinessEpoch.get()
+        watchdogThread = thread(name = "adopted-watch", isDaemon = true) {
+            var misses = 0
+            try {
+                while (!isShuttingDown && adopted) {
+                    Thread.sleep(ADOPTED_WATCH_INTERVAL_MS)
+                    if (isShuttingDown || !adopted) return@thread
+                    if (isServerHealthy()) {
+                        misses = 0
+                        continue
+                    }
+                    if (++misses < ADOPTED_WATCH_MISSES) continue
+
+                    val exitEpoch = synchronized(readinessLock) {
+                        if (isShuttingDown || !adopted || readinessEpoch.get() != epoch) return@thread
+                        clearReadiness()
+                        adopted = false
+                        readinessEpoch.get()
+                    }
+                    Logger.w(tag, "Adopted server stopped answering; treating it as gone")
+                    synchronized(readinessLock) {
+                        if (!isShuttingDown && readinessEpoch.get() == exitEpoch) {
+                            onServerCrashed?.invoke(ADOPTED_SERVER_LOST)
+                        }
+                    }
+                    return@thread
+                }
+            } catch (e: InterruptedException) {
+                Logger.d(tag, "Adoption watch interrupted")
+            }
+        }
+    }
+
+    /**
+     * Starts a daemon thread that waits for the server process to exit.
+     *
+     * Readiness is cleared whatever the reason and before the shutdown branch,
+     * because a process that has exited is not serving.
+     *
+     * If [isShuttingDown] is `true`, the exit is expected and no callback fires.
+     * Otherwise, [onServerCrashed] is invoked with the exit code.
+     *
+     * Exit code interpretation:
+     * - 0: clean exit
+     * - 137: SIGKILL, typically the OOM killer or the phantom process limit
+     * - 129 to 192: killed by some other signal, named through [signalName].
+     *   This said "unexpected crash" while the bootstrap collapsed every signal
+     *   to a clean zero, which made even the 137 above unreachable
+     * - anything else: unexpected crash
+     */
+    private fun startWatchdog() {
+        val process = serverProcess ?: return
+        val epoch = readinessEpoch.get()
+        watchdogThread = thread(name = "node-watchdog", isDaemon = true) {
+            try {
+                val exitCode = process.waitFor()
+                // Before the shutdown branch, not inside it. A process that has
+                // exited is not serving whatever the reason, and this is the only
+                // thread that learns about a crash -- leaving the flag set here
+                // would have the main thread navigate to a dead port for the
+                // whole restart, which is the case this flag exists for.
+                val exitEpoch = synchronized(readinessLock) {
+                    if (serverProcess !== process || readinessEpoch.get() != epoch) return@thread
+                    clearReadiness()
+                    readinessEpoch.get()
+                }
+                if (isShuttingDown) {
+                    Logger.i(tag, "Server shut down gracefully")
+                    return@thread
+                }
+                val ending = when {
+                    exitCode == 0 -> "Server exited cleanly"
+                    exitCode == 137 -> "Server killed (OOM or phantom limit)"
+                    // The bootstrap reports a killed child as 128 + signal, so any
+                    // other signal is named rather than printed as a bare number.
+                    // Before, none of these could arrive: the bootstrap collapsed
+                    // every signal to a clean zero, so even the 137 branch above
+                    // was unreachable.
+                    exitCode in 129..192 -> "Server killed by ${signalName(exitCode - 128)}"
+                    else -> "Server crashed with exit code $exitCode"
+                }
+                when {
+                    exitCode == 0 -> Logger.i(tag, ending)
+                    exitCode in 129..192 -> Logger.w(tag, ending)
+                    else -> Logger.e(tag, ending)
+                }
+                // Mirrored for the same reason as the refused spawn in
+                // [startServer]: the gave-up page and the bug report read
+                // server.log, and a server killed before it printed anything left
+                // only its start summary there. Before the callback, so the page
+                // that callback may lead to already has the line.
+                serverLog.append(ending)
+                // Logging can overlap a stop or restart, so delivery needs the same owner check.
+                synchronized(readinessLock) {
+                    if (!isShuttingDown && serverProcess === process && readinessEpoch.get() == exitEpoch) {
+                        onServerCrashed?.invoke(exitCode)
+                    }
+                }
+            } catch (e: InterruptedException) {
+                Logger.d(tag, "Watchdog interrupted")
+            }
+        }
+    }
+}
+
+/**
+ * The POSIX signal name for a number, for the few that actually end a process
+ * here. Named rather than numbered because "killed by SIGKILL" and "killed by
+ * SIGSEGV" send a reader to different places, while "exit code 139" sends them
+ * to a search engine.
+ */
+internal fun signalName(signum: Int): String = when (signum) {
+    2 -> "SIGINT"
+    6 -> "SIGABRT"
+    9 -> "SIGKILL"
+    11 -> "SIGSEGV"
+    15 -> "SIGTERM"
+    else -> "signal $signum"
+}
+
+/**
+ * How long a deliberate stop waits before killing the server outright.
+ *
+ * Short on purpose: this is paid on the caller's thread, and the notification's
+ * Stop action calls it on the main thread. See [ProcessManager.stopServer].
+ */
+internal const val GRACEFUL_STOP_TIMEOUT_MS = 1_000L
+
+/**
+ * How long a start waits for a reaped server's socket to actually close.
+ *
+ * Half a second, and it buys the difference between "the signal was sent" and
+ * "the port is free", which is what the verdict behind it actually needs. Cheap
+ * because it is spent only on a start that reaped something and only while the
+ * port still reads held: see `ProcessManager.portFreedByReap`. Small because the
+ * alternative it competes with is not a longer wait but a wrong verdict, and the
+ * holder that is still there after half a second is the one the verdict is for.
+ */
+internal const val REAP_PORT_RELEASE_GRACE_MS = 500L
+
+/** How often the port is asked inside that grace. */
+internal const val REAP_PORT_POLL_MS = 100L
+
+/**
+ * How long [ProcessManager.waitForReady] polls before giving up.
+ *
+ * A named constant rather than a literal default because two other numbers are
+ * measured against it and could not previously say so: `LATE_READY_NOTICE_MS`
+ * documents itself as "the other half of that sum", and the restart backoff has
+ * to be shorter than this or a launch attempt outlives the crash path that
+ * superseded it.
+ *
+ * Note the poll runs to the end whatever the process does -- it asks the port,
+ * not the process -- so a server that dies one second in is still polled for the
+ * remaining twenty-nine.
+ */
+internal const val READY_POLL_TIMEOUT_MS = 30_000L
+
+/**
+ * How often an adopted server is asked whether it is still there.
+ *
+ * Slower than a readiness poll because nothing is waiting on the answer: this
+ * is a heartbeat over the life of a session, not a startup check, and it runs
+ * for as long as the adopted server does.
+ */
+internal const val ADOPTED_WATCH_INTERVAL_MS = 5_000L
+
+/**
+ * How many consecutive unanswered probes count as gone.
+ *
+ * Two rather than one, for the reason [ProcessManager.probeReadiness] gives for
+ * not clearing readiness on a single failure: one refused connection is not
+ * evidence of death. Being wrong this way costs a restart nobody needed; being
+ * wrong the other way costs an editor that stopped working with nothing said.
+ */
+internal const val ADOPTED_WATCH_MISSES = 2
+
+/**
+ * The exit code reported when an adopted server stops answering.
+ *
+ * Negative so it cannot collide with a real process exit status, which is what
+ * every other value reaching `onServerCrashed` is. Nothing branches on it today;
+ * it exists so a log line naming it is not mistaken for a signal.
+ */
+internal const val ADOPTED_SERVER_LOST = -1
+
+/**
+ * Where `assets/server.js` records the pid of the editor server it forked.
+ *
+ * Inside the server directory rather than beside the connection token: this is
+ * disposable state about one run, and the token is a credential the backup rules
+ * are written to keep off any cloud. Keeping them apart means a future rule about
+ * one cannot silently pick up the other.
+ */
+internal const val EDITOR_PID_FILE = "editor-server.pid"
+
+/**
+ * The argv fragment that identifies a recorded pid as still being our server.
+ *
+ * A pid on its own proves nothing after it has been recycled, and Android reuses
+ * them freely. This is checked against `/proc/<pid>/cmdline`, which is readable
+ * for this app's own processes and not for anyone else's, so another app's
+ * process reads as absent rather than as a match, and the check fails closed.
+ */
+internal const val EDITOR_ENTRY_POINT = "server-main.js"
+
+/**
+ * What the editor server prints once its listen has succeeded.
+ *
+ * `server-main.js` builds this line inside its `listen` callback and writes it with
+ * `console.log`, so it exists only after the socket is bound, and it arrives here
+ * because `assets/server.js` forks the child with `stdio: 'inherit'`. A child that
+ * lost the port prints `EADDRINUSE` and never this. [ProcessManager.probeReadiness]
+ * reads it as the one statement about the port that comes from a process of ours
+ * rather than from whoever holds the socket, which is what readiness has to rest
+ * on before the connection token is sent there.
+ *
+ * Upstream text, not ours, so a VS Code bump can change it. If one does, no
+ * spawned start ever becomes ready: the process is alive and bound, the poll gives
+ * up, and `NodeService.awaitLateReadiness` says so at its notice and keeps asking.
+ * That is visible on the first device run after the bump, and
+ * `ServerListeningLineWireTest` reads the packaged tree for the line wherever that
+ * tree has been fetched.
+ */
+internal const val SERVER_LISTENING_LINE = "Extension host agent listening on"
+
+/**
+ * Where the packaged server records which build it is, relative to the server
+ * directory.
+ *
+ * Read for one purpose: `/version` answers `productService.commit` from this
+ * file, so it is the value a holder of the port has to produce before adoption
+ * will hand it the WebView. Nothing here writes it; the build does, and
+ * `assets/server.js` leaves the key alone when it rewrites the file.
+ */
+internal const val REH_PRODUCT_FILE = "vscode-reh/product.json"
+
+/**
+ * How much of a `/version` answer is read before the reader stops.
+ *
+ * A commit is forty characters; this is room for that and a newline several times
+ * over. It is a bound rather than a size because the party answering may be the
+ * one adoption is trying to rule out, and the socket's read timeout limits each
+ * read rather than the total, so nothing else stops a holder that keeps sending.
+ */
+internal const val VERSION_BODY_MAX_CHARS = 128
+
+/** What every device ran before the ceiling was derived, and the fallback. */
+internal const val HEAP_CEILING_DEFAULT_MB = 512
+internal const val HEAP_CEILING_MIN_MB = 256
+internal const val HEAP_CEILING_MAX_MB = 768
+
+/**
+ * The divisor the override arm is bounded by, against the eighth the derived arm uses.
+ *
+ * A quarter is the largest fraction that still leaves the other isolates
+ * somewhere to live. See [heapOverrideMaxMb] for the count of them, which is the
+ * reason the fraction cannot be raised much further whatever the device holds.
+ */
+internal const val HEAP_OVERRIDE_DIVISOR = 4
+
+/**
+ * The hard stop on a user-chosen ceiling, whatever the device reports.
+ *
+ * NOT MEASURED, and it should not be presented as though it were. It is twice the
+ * largest number any device gets today, which is the largest step that can be
+ * argued for from the reasoning in [heapOverrideMaxMb] alone. Settling it needs a
+ * device run that nobody has done: spawn the server with a raised ceiling on an
+ * 8 GB device, drive a large workspace, and read VmHWM for the node child out of
+ * `/proc`, which this app may do for its own children.
+ */
+internal const val HEAP_OVERRIDE_ABS_MAX_MB = 1536
+
+/**
+ * The `settings.json` key a user sets to override the derived ceiling.
+ *
+ * Duplicated in the bundled process-monitor extension's `contributes.configuration`,
+ * which is what puts it in the workbench Settings UI. The two are held together by
+ * `HeapSettingManifestParityTest`, because drifting them apart produces a setting
+ * that appears in the UI and does nothing, with nothing failing anywhere.
+ */
+internal const val HEAP_SETTING_KEY = "vscodroid.server.heapCeilingMb"
+
+/**
+ * How many SIGKILLs a user-chosen ceiling is allowed before it is disabled.
+ *
+ * See [heapKillsAfter] for why a SIGKILL is the event counted and what that
+ * deliberately over-counts.
+ */
+internal const val HEAP_OVERRIDE_KILL_BUDGET = 3
+
+/**
+ * Where the kill count and the value it was counted against are kept.
+ *
+ * SharedPreferences and not a field, because the thing being bounded outlives the
+ * process. `NodeService.restartCount` is in-memory and resets on every
+ * `onCreate`, so a counter kept there would hand a fatal value a fresh budget of
+ * five on every relaunch and repeat forever, which is the exact loop this latch
+ * exists to end.
+ */
+internal const val PREF_HEAP_KILLS = "heap_override_kills"
+internal const val PREF_HEAP_VALUE_SEEN = "heap_override_value_seen"
+
+/** The preferences file `PortFinder` and `SplashActivity` already share. */
+internal const val HEAP_PREFS_NAME = "vscodroid"
+
+/**
+ * The largest ceiling a user may ask for on a device of this size.
+ *
+ * ```
+ * heapOverrideMaxMb(T) = clamp(T / 4, heapCeilingMb(T, isLowRam = false), 1536)
+ * ```
+ *
+ * Each bound answers a different failure, and none of the three is decorative.
+ *
+ * The fraction, T/4, bounds the request against the device rather than against a
+ * literal. The derived arm spends an eighth because the editor server is one of
+ * several processes this app is responsible for; a quarter is the most that can be
+ * spent on it while the Extension Host isolate, the Pty Host isolate, the forked
+ * file watcher, tsserver, the app process and the Chromium renderer still have
+ * somewhere to live. Note what makes that count matter: the flag is a PER-ISOLATE
+ * limit, not one heap shared between them, so a request of R authorises roughly
+ * 5R of V8 old space inside the server process family before anything native is
+ * counted. See [heapCeilingForDevice] for the measurement behind that.
+ *
+ * The absolute cap, 1536, exists because the fraction stops protecting once T is
+ * large: on a 16 GiB tablet T/4 is about 3900, and five isolates of that is more
+ * V8 old space than the device can hold beside the renderer. Without this bound the
+ * knob would let the app destabilise the DEVICE rather than only the editor, and
+ * that failure is invisible from inside the app: Android's low-memory killer works
+ * from `oom_score_adj` and does not read V8 flags, so with VSCodroid in the
+ * foreground the processes it reaches first belong to somebody else.
+ *
+ * The floor is what the DERIVED arm hands this same device, so the override
+ * ceiling can never sit below the number the user would have had by setting
+ * nothing at all, which would read as the setting having broken something. It is
+ * computed rather than written down, and that is the correction: the floor used to
+ * be [HEAP_CEILING_MAX_MB], which is the derived arm's MAXIMUM and not its value,
+ * and the paragraph defending it worked from a 2 GB phone reaching 768 with no
+ * setting. It reaches 256 there, `clamp(2048 / 8, 256, 768)`, pinned by `the
+ * derived band binds exactly where the arithmetic says`. So T/4 exceeded a flat 768
+ * only from 3072 MiB upward, and below that the fraction, which is the whole of the
+ * safety argument on a small device, bound on nothing: a 2 GB phone was allowed
+ * 768, and the flag being per-isolate makes that about five times 768 of V8 old
+ * space on a device that holds 2048.
+ *
+ * `isLowRam = false` is not an assumption about the device. [heapCeilingMb]
+ * consults this only on the arm where a request is honoured, and
+ * [heapOverrideHonoured] requires the flag to be clear before it takes that arm, so
+ * the low-RAM case cannot reach here.
+ *
+ * The floor also keeps the clamp it feeds non-empty, which is worth knowing before
+ * anyone replaces it with a bare fraction. [heapCeilingMb] coerces a request into
+ * `[HEAP_CEILING_MIN_MB, heapOverrideMaxMb(T)]` and `coerceIn` throws on a maximum
+ * below its minimum; the derived arm never answers below [HEAP_CEILING_MIN_MB], so
+ * this cannot. A bare T/4 could: a quarter of a 900 MiB device is 225.
+ */
+internal fun heapOverrideMaxMb(totalRamMb: Long): Int =
+    (totalRamMb / HEAP_OVERRIDE_DIVISOR)
+        .coerceIn(
+            heapCeilingMb(totalRamMb, isLowRam = false).toLong(),
+            HEAP_OVERRIDE_ABS_MAX_MB.toLong(),
+        )
+        .toInt()
+
+/**
+ * An eighth of RAM, held inside a band, unless the user has asked for a number.
+ *
+ * ```
+ * heapCeilingMb(T, lowRam, R) =
+ *     256                                       if lowRam
+ *     512                                       if T <= 0
+ *     clamp(R, 256, heapOverrideMaxMb(T))       if R is present
+ *     clamp(T / 8, 256, 768)                    otherwise
+ * ```
+ *
+ * The eighth is a budget rather than a measurement: the editor server is one of
+ * several processes this app is responsible for, and the flag governs only the
+ * V8 heap inside one of them. The floor exists because below it the editor
+ * cannot open a real project at all, so a device that cannot afford the floor is
+ * going to struggle whatever number is chosen. The ceiling exists because past
+ * it the limit stops being what ends the process -- Android's low-memory killer
+ * does, and it does not read flags.
+ *
+ * A device the manufacturer flagged as low-RAM gets the floor whatever its
+ * total says, because that flag is the OEM stating the device is constrained in
+ * ways totalMem does not show.
+ *
+ * THE ORDER OF THE FOUR ARMS IS THE SAFETY ARGUMENT, so it is written down rather
+ * than left to the reader. Both short-circuits sit ABOVE the override on purpose.
+ * The low-RAM flag is the manufacturer stating that totalMem overstates what this
+ * device can spare, and a user cannot know better than the OEM about their own
+ * hardware, so their number is not consulted. The unreadable-total case is above it
+ * for a different reason: the override's whole protection is a clamp computed from
+ * T, so with no T there is nothing to clamp a request against, and honouring one
+ * there would be honouring it unbounded.
+ *
+ * The floor applies to a request as well, and in the RAISING direction. Below 256
+ * the editor cannot open a real project, which is the existing reason for the
+ * floor; a user who asks for less gains nothing and loses the editor.
+ *
+ * A request may lower as well as raise. That is deliberate and is worth stating,
+ * because the obvious defensive move -- refusing to go below the derived value --
+ * would take away the only thing a user on a struggling device can do from here.
+ */
+internal fun heapCeilingMb(totalRamMb: Long, isLowRam: Boolean, requestedMb: Int? = null): Int {
+    if (heapOverrideHonoured(totalRamMb, isLowRam, requestedMb)) {
+        return requestedMb!!.coerceIn(HEAP_CEILING_MIN_MB, heapOverrideMaxMb(totalRamMb))
+    }
+    if (isLowRam) return HEAP_CEILING_MIN_MB
+    // Guard the unreadable case rather than trusting it: totalMem has been seen
+    // to report 0 on emulators, and 0/8 would silently become the floor while
+    // looking like a considered decision.
+    if (totalRamMb <= 0) return HEAP_CEILING_DEFAULT_MB
+    return (totalRamMb / 8).coerceIn(
+        HEAP_CEILING_MIN_MB.toLong(), HEAP_CEILING_MAX_MB.toLong()
+    ).toInt()
+}
+
+/**
+ * Whether a request is the arm [heapCeilingMb] will actually take.
+ *
+ * Split out rather than left implicit in the ordering of [heapCeilingMb]'s arms,
+ * because two callers need the same answer and a second copy of the condition is
+ * a copy that can drift.
+ *
+ * The second caller is the kill latch, and the drift would be silent in the worst
+ * direction. `heapOverrideActive` records whether the running server was given the
+ * user's number, and it is what decides whose budget a `SIGKILL` spends. Answering
+ * it with "a request was present" rather than "a request was taken" charges a
+ * low-RAM device's kills, and an unreadable-total device's kills, to a value that
+ * those devices never ran with, and three of those disable a setting the user
+ * never actually got to try.
+ */
+internal fun heapOverrideHonoured(totalRamMb: Long, isLowRam: Boolean, requestedMb: Int?): Boolean =
+    requestedMb != null && !isLowRam && totalRamMb > 0
+
+/**
+ * Whether an honoured request puts the ceiling ABOVE what the device would have
+ * been given with no request at all.
+ *
+ * The kill latch turns on this and not on [heapOverrideHonoured], and the
+ * difference is the whole of it. `heapCeilingMb` supports lowering as well as
+ * raising, on purpose: lowering is the only thing a user on a struggling device
+ * can do from this setting. The latch's remedy for a value that keeps getting the
+ * server killed is to ignore it and fall back to the derived arm, which for a
+ * lowered value is the LARGER number. So a direction-blind latch answered three
+ * kills on a device that was already short of memory by doubling the ceiling on
+ * it, and told the user, in a notice inviting them to pick another value, that
+ * their limit had been turned off. Picking another value handed them a fresh
+ * budget, and the loop had no end.
+ *
+ * A ceiling that is not larger than the derived one cannot be the cause the latch
+ * exists to end, so it is neither charged nor suspended. That is not a softening
+ * of the protection: every value the latch was built for is a raise, and the
+ * deliberate over-count `heapKillsAfter` documents (the phantom-process limit
+ * produces the same 137) is only defensible in that direction, because the false
+ * positive it accepts costs a raising user a notification and costs a lowering
+ * user the device.
+ *
+ * Equality counts as "not raised". A request that lands exactly on the derived
+ * value changes nothing about what runs, so there is nothing about it to disable.
+ */
+internal fun heapOverrideRaisesCeiling(
+    totalRamMb: Long,
+    isLowRam: Boolean,
+    requestedMb: Int?,
+): Boolean =
+    heapOverrideHonoured(totalRamMb, isLowRam, requestedMb) &&
+        heapCeilingMb(totalRamMb, isLowRam, requestedMb) >
+        heapCeilingMb(totalRamMb, isLowRam, null)
+
+/**
+ * The requested ceiling, read out of a `settings.json` document, or null.
+ *
+ * The `(?m)^\s*` anchor is load-bearing rather than tidiness. settings.json is
+ * JSONC and the documents this app writes carry comments; without the anchor a
+ * commented-out `// "vscodroid.server.heapCeilingMb": 8192` sitting in the user's
+ * file as an example would be honoured as though they had set it, and nothing
+ * would look wrong until the device started dying. This repository has been bitten
+ * by exactly that blindness before.
+ *
+ * The anchor answers only the `//` form, so block comments are removed first.
+ * A key on a line of its own inside a `/* ... */` span starts that line exactly
+ * as a live one does, and the anchor honoured it: a user who blocked out an
+ * experiment to switch it off had the raised ceiling spawned anyway, the start
+ * summary said "user override", and three kills later the card told them a
+ * setting they believed was off had been suspended. The span is removed rather
+ * than parsed around, because the reader wants nothing from inside it, and it is
+ * removed non-greedily so a second comment further down does not swallow the
+ * live key between the two.
+ *
+ * Removing a comment means recognising one, and a delimiter is only a delimiter
+ * outside a string. That is not a hypothetical here: the default document this
+ * app writes plants three openers itself, inside the `<node_internals>` globs of
+ * its `launch` block, and no closer at all. `launch` is the last property and the
+ * workbench appends new keys after the last one, so a user's ceiling lands after
+ * all three openers, and the first exclude glob they add on the same settings tab
+ * supplies the closer. Everything between, the ceiling included, then read as one
+ * comment: the start summary said "derived from device RAM" while the settings
+ * editor went on showing the number, and for a value the user had LOWERED the
+ * fallback is the larger of the two. So [STRING_OR_COMMENT] walks strings and
+ * comments together in one left-to-right pass and keeps the strings.
+ *
+ * A regex over the text rather than a parse, for the reason
+ * `FirstRunSetup.refreshManagedPaths` documents at length: parsing the document to
+ * re-serialise it would strip the user's comments, escape every slash and turn
+ * `["-i",]` into `["-i", null]`. This one only reads, so it does not even risk
+ * that -- but the same reasoning says a JSON parser has no business being pointed
+ * at a document it cannot faithfully reproduce.
+ *
+ * `\d+` and not something looser, so a quoted `"1024"` reads as absent rather than
+ * as a number. A setting written with the wrong type is a mistake, and falling back
+ * to the derived value is the safe reading of one.
+ */
+internal fun heapOverrideFromSettings(content: String): Int? =
+    HEAP_SETTING_PATTERN.find(
+        STRING_OR_COMMENT.replace(content) { if (it.value.startsWith("\"")) it.value else "" }
+    )?.groupValues?.get(1)?.toIntOrNull()
+
+private val HEAP_SETTING_PATTERN =
+    Regex("""(?m)^\s*"${Regex.escape(HEAP_SETTING_KEY)}"\s*:\s*(\d+)""")
+
+/**
+ * A JSON string, a `//` comment, or a block comment, whichever starts first.
+ *
+ * Three arms and each one earns its place. The string arm leads so a delimiter
+ * inside a value is text, which is the whole point. The `//` arm is not
+ * decoration: a line comment is prose, an unbalanced quote in prose is ordinary,
+ * and without an arm of its own that quote opens a "string" that runs to the next
+ * quote in the file, takes the block opener after it inside, and hands a
+ * commented-out ceiling straight back to the anchor. The block arm is
+ * shortest-match, for the reason the reader's own documentation gives.
+ */
+private val STRING_OR_COMMENT = Regex(""""(?:\\.|[^"\\])*"|//[^\n]*|/\*[\s\S]*?\*/""")
+
+/**
+ * Whether a user-chosen ceiling has spent its budget and must be ignored.
+ *
+ * A separate counter from `NodeService.restartCount` and not folded into it: that
+ * one is a per-run restart budget with its own documented boundary, and reusing it
+ * would change what every crash cause means, not only this one.
+ */
+internal fun heapOverrideSuspended(kills: Int, budget: Int = HEAP_OVERRIDE_KILL_BUDGET) =
+    kills >= budget
+
+/**
+ * The kill count that applies to [currentValue], given what was last recorded.
+ *
+ * Changing the number is a fresh decision by the user and gets a fresh budget.
+ * Without this the count would be permanent: a value disabled after three kills
+ * could never be re-enabled by lowering it, because the counter it is judged
+ * against would still be full, and the only way out would be clearing app data --
+ * which destroys `filesDir`, and with it the user's projects, their installed
+ * toolchains and their extensions.
+ */
+internal fun heapKillsForValue(storedValue: Int, storedKills: Int, currentValue: Int) =
+    if (storedValue == currentValue) storedKills else 0
+
+/**
+ * The kill count after an exit, counting only what a too-high ceiling produces.
+ *
+ * 137 is `128 + SIGKILL`, which `assets/server.js` produces from its child's signal
+ * and the watchdog already names. It is the right event to count and a deliberate
+ * over-count, and both halves need saying.
+ *
+ * Right, because a ceiling set higher than the device can hold does not fail at
+ * START. V8 reserves virtual address space rather than committing it, so a node
+ * spawned with `--max-old-space-size=4096` on a 4 GB phone comes up normally; the
+ * failure is deferred and load-dependent, and arrives as the low-memory killer.
+ * A latch that asked "did the last start survive" would therefore never fire.
+ *
+ * Over-counting, because the phantom-process limit produces the same 137 and the
+ * app cannot tell the two apart. Nothing here reads exit reasons or memory state,
+ * and both arrive through the same path. The direction is chosen rather than
+ * conceded: a false positive costs the user one notification and a setting to
+ * re-enter, while a false negative is an app that crash-loops across every relaunch
+ * with no way back in, because `restartCount` resets each launch and the terminal
+ * state therefore does not stick.
+ *
+ * What is deliberately NOT counted is exit 134, `128 + SIGABRT`, which is what V8's
+ * own heap-limit abort produces along with a `FATAL ERROR: JavaScript heap out of
+ * memory` line that `startOutputReader` puts into `server.log`. That is the ceiling
+ * working as intended, and disabling a value for doing its job would be backwards.
+ * `ADOPTED_SERVER_LOST` is not counted for a plainer reason: an adopted server never
+ * ran with this value at all.
+ *
+ * The flag passed in answers [heapOverrideRaisesCeiling], not merely "a value was
+ * honoured". A value that lowered the ceiling is not counted, because the remedy
+ * for a spent budget is the derived ceiling and that is the larger of the two.
+ */
+internal fun heapKillsAfter(exitCode: Int, overrideRaisedCeiling: Boolean, current: Int) =
+    if (overrideRaisedCeiling && exitCode == HEAP_OVERRIDE_FATAL_EXIT) current + 1 else current
+
+/** `128 + SIGKILL`, as `assets/server.js` reports a signalled child. */
+internal const val HEAP_OVERRIDE_FATAL_EXIT = 137
+
+/**
+ * The line the editor server prints for each load of a folder that has no
+ * `.vscode/settings.json`: `File not found: <absolute path>`.
+ *
+ * The page reads that file before it paints, to start on the folder's theme, and a
+ * missing one is the usual case and answers 404, which the server's resource
+ * handler logs as an error line. It says nothing, and it is the one line of the
+ * server's output that names the folder the user opened, every load, so it
+ * filled the tail a bug report quotes with a path that report did not need. Only
+ * this probe's file is dropped: a `File not found` for anything else is still the
+ * server telling us something.
+ */
+internal fun isSettingsProbeMiss(line: String): Boolean =
+    line.startsWith("File not found: ") && line.endsWith("/.vscode/settings.json")
+

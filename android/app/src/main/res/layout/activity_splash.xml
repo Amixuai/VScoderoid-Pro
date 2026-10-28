@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- keepScreenOn is load-bearing, and the manifest points here for it. First-run
+     setup unpacks over 800 MB and takes minutes with nothing for the user to
+     touch, so the display times out partway through every time. What that costs
+     is not the drawing: the window stops being visible, the activity is stopped,
+     and a process holding nothing but a stopped activity is what the system
+     reclaims first, in the middle of writing out 810 MB. A retry of the same
+     build now skips the files it already wrote at the right length, so the cost
+     is no longer the whole unpack; it is still the rest of it, and the process
+     still holds no component while it runs.
+
+     On the root view rather than as a window flag, so it lasts exactly as long as
+     this screen does. setContentView swaps in the picker next, which waits on a
+     person and could hold the display awake until the battery is flat; a window
+     flag would keep burning through that wait, and this drops the moment the
+     view is detached.
+
+     What that argument does not cover is the wait this same layout hosts. When
+     setup fails, showSetupError rewrites the status line and adds a Retry button
+     into this view, so nothing is in flight and the screen changes only when a
+     person taps, with the flag still held. showSetupError clears it there and
+     Retry sets it back, which is the picker's argument one screen earlier.
+
+     The id is what both of those need: it is looked up to clear the flag and to
+     pad the root for the system bars, which every other full-screen root in the
+     app gets at its own setContentView. Without one this was the only screen
+     drawing under the navigation bar. -->
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/splashRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:keepScreenOn="true">
+
+    <!-- App icon. Decorative: the TextView below carries the same @string/app_name
+         as visible text, so describing the icon with it made a screen reader open
+         the app by saying "VSCodroid" twice before reaching the status line that
+         says what is actually happening. importantForAccessibility rather than a
+         null contentDescription, so lint has the answer to why there is none. -->
+    <ImageView
+        android:id="@+id/appIcon"
+        android:layout_width="96dp"
+        android:layout_height="96dp"
+        android:src="@mipmap/ic_launcher"
+        android:importantForAccessibility="no"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toTopOf="@+id/appName"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintVertical_chainStyle="packed"
+        app:layout_constraintVertical_bias="0.4" />
+
+    <!-- App name -->
+    <TextView
+        android:id="@+id/appName"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="@string/app_name"
+        android:textColor="@color/colorOnSurface"
+        android:textSize="28sp"
+        android:textStyle="bold"
+        app:layout_constraintTop_toBottomOf="@+id/appIcon"
+        app:layout_constraintBottom_toTopOf="@+id/statusText"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- Status message (e.g., "Extracting core files...") -->
+    <TextView
+        android:id="@+id/statusText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:text="@string/extracting_message"
+        android:textColor="@color/colorOnSurface"
+        android:textSize="14sp"
+        android:alpha="0.7"
+        app:layout_constraintTop_toBottomOf="@+id/appName"
+        app:layout_constraintBottom_toTopOf="@+id/progressBar"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- Progress bar -->
+    <ProgressBar
+        android:id="@+id/progressBar"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="200dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:indeterminate="false"
+        android:max="100"
+        android:progress="0"
+        android:progressTint="@color/colorPrimary"
+        android:indeterminateTint="@color/colorPrimary"
+        app:layout_constraintTop_toBottomOf="@+id/statusText"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>

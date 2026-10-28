@@ -1,0 +1,64 @@
+Size the activity bar overflow from the room its siblings leave.
+
+Written when the mobile stylesheet hid the Manage section, which freed vertical
+space that this.dimension was measured before. The overflow calculation then
+moved icons into the "..." menu while the room for them was visibly there -- on
+a phone that was every view: Explorer, Search, Source Control, Run and Debug and
+Extensions all ended up behind the menu. The hide was removed on 2026-08-15,
+and the fix holds either way: it reads the room the siblings actually leave,
+whatever is or is not shown around the bar.
+
+Reading the bar's own clientHeight does not fix it and makes it worse. That
+height is the RESULT of how many icons fit, so once they overflow the element
+collapses to one row and reports 48px, and the calculation can never recover.
+Measured on a 863px bar: the element read 48 while 732 were free, room for 15
+icons rather than 1.
+
+What is actually available is what the siblings leave in the parent -- the
+compact menubar above and the global actions below. Read through
+document.querySelector rather than a field because this class is handed its
+container by a caller that does not retain it, scoped to .activitybar so the
+panel's own composite bar is untouched, and falling back to the cached value
+when the query does not match or measures zero.
+
+diff --git a/src/vs/workbench/browser/parts/compositeBar.ts b/src/vs/workbench/browser/parts/compositeBar.ts
+index 8d1020b..dea1902 100644
+--- a/src/vs/workbench/browser/parts/compositeBar.ts
++++ b/src/vs/workbench/browser/parts/compositeBar.ts
+@@ -533,7 +533,35 @@ export class CompositeBar extends Widget implements ICompositeBar {
+ 		let maxVisible = compositesToShow.length;
+ 		const totalComposites = compositesToShow.length;
+ 		let size = 0;
+-		const limit = this.options.orientation === ActionsOrientation.VERTICAL ? this.dimension.height : this.dimension.width;
++		// Measure the room the bar actually has, not the dimension this.dimension
++		// cached at an earlier layout. Its own clientHeight is no good
++		// here: that is the RESULT of how many icons fit, so once they overflow it
++		// collapses to a single row and the calculation can never recover -- which on
++		// a phone left every view in the "..." menu with the space visibly free
++		// (first seen when a stylesheet hid the Manage section; the live measure
++		// below is correct whatever is or is not shown around the bar).
++		//
++		// The room is what the siblings leave in the parent: the compact menubar above
++		// and the global actions below. Queried from the document because this class is
++		// given its container by a caller that does not keep it, and scoped to
++		// .activitybar so the panel's own composite bar is untouched. Falls back to the
++		// cached dimension when the query does not match.
++		let liveHeight: number | undefined;
++		const activityBar = document.querySelector('.activitybar .composite-bar');
++		const activityBarParent = activityBar?.parentElement;
++		if (activityBarParent) {
++			let used = 0;
++			for (let i = 0; i < activityBarParent.children.length; i++) {
++				const sibling = activityBarParent.children[i];
++				if (sibling !== activityBar) {
++					used += (sibling as HTMLElement).offsetHeight;
++				}
++			}
++			liveHeight = activityBarParent.clientHeight - used;
++		}
++		const limit = this.options.orientation === ActionsOrientation.VERTICAL
++			? (liveHeight && liveHeight > 0 ? liveHeight : this.dimension.height)
++			: this.dimension.width;
+ 
+ 		// Add composites while they fit
+ 		for (let i = 0; i < compositesToShow.length; i++) {

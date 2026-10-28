@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>VSCodroid | VS Code on Android</title>
+<meta name="description" content="A full VS Code editor running natively on Android, with a real terminal, Git, Node.js and Python bundled. Download, open, code.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="assets/vscodroid.png" type="image/png">
+<link rel="stylesheet" href="assets/style.css">
+<meta property="og:title" content="VSCodroid">
+<meta property="og:description" content="VS Code on Android, with a real terminal and toolchain. Download, open, code.">
+<meta property="og:image" content="assets/feature_graphic.png">
+<meta property="og:type" content="website">
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="./">
+      <img src="assets/vscodroid.png" alt="" width="128" height="128">
+      VSCodroid
+    </a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="guide.html">User guide</a>
+      <a href="privacy-policy.html">Privacy</a>
+      <a href="https://github.com/Amixuai/Vscoderoid-Pro">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div>
+        <h1>VS Code, on your phone.</h1>
+        <p class="lede">
+          Not an editor inspired by it. The real workbench, with a real
+          terminal, running natively on Android.
+        </p>
+        <div class="hero-actions">
+          <a class="btn btn-primary"
+             href="https://github.com/Amixuai/Vscoderoid-Pro/releases">
+            Download the APK
+          </a>
+        </div>
+        <p class="hero-note">
+          Android 11 or newer, 64-bit. Around 738 MB free space for the first
+          launch, and much less for each update.
+        </p>
+      </div>
+      <div class="device">
+        <img src="assets/01_editor.png"
+             alt="VSCodroid open on a phone, showing the Get Started walkthrough inside the VS Code workbench."
+             width="404" height="900" fetchpriority="high">
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <h2>What you get</h2>
+      <p class="section-intro">
+        Everything needed to actually work is bundled. There is no setup step,
+        no Termux to install first, and nothing to configure before the first
+        file opens.
+      </p>
+      <ul class="features">
+        <li class="feature">
+          <h3>The real workbench</h3>
+          <p>
+            Built from the MIT-licensed Code&nbsp;-&nbsp;OSS source, so the
+            editor, the command palette, settings and keybindings are the ones
+            you already know.
+          </p>
+        </li>
+        <li class="feature">
+          <h3>A real terminal</h3>
+          <p>
+            Bash on a proper PTY, with Git, make, ripgrep, tmux and OpenSSH
+            already on the path. Not a shell emulator over a socket.
+          </p>
+        </li>
+        <li class="feature">
+          <h3>Node.js and Python, bundled</h3>
+          <p>
+            Node&nbsp;24 with npm, and Python&nbsp;3 with pip, both installed on
+            first launch. Ruby, Java&nbsp;21 and C/C++ install on demand when you
+            ask for them.
+          </p>
+        </li>
+        <li class="feature">
+          <h3>Extensions from Open VSX</h3>
+          <p>
+            Browse and install from the extensions view as usual. Extensions
+            written in JavaScript work; the few that ship a desktop Linux binary
+            do not.
+          </p>
+        </li>
+        <li class="feature">
+          <h3>Your own files</h3>
+          <p>
+            Work in the app's own project directory, or open a folder from
+            device storage: the app keeps a working copy and writes your changes
+            back to the original. Both are ordinary folders to the editor.
+          </p>
+        </li>
+        <li class="feature">
+          <h3>Offline once installed</h3>
+          <p>
+            No telemetry, and no update service to call. Editing, the terminal
+            and the bundled runtimes all work with the network off; installing
+            extensions, downloading a language toolchain and the package
+            managers are what need it.
+          </p>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section section-sunken">
+    <div class="wrap">
+      <h2>Getting started</h2>
+      <p class="section-intro">
+        Four steps, and only the unpacking and the language downloads take any
+        waiting.
+      </p>
+      <ol class="steps">
+        <li>
+          <div>
+            <h3>Install</h3>
+            <p>
+              By sideloading the APK from GitHub Releases.
+            </p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h3>Let it unpack</h3>
+            <p>
+              The first launch extracts the editor and the bundled tools behind
+              a progress bar, and it needs the space before it starts rather than
+              partway through. It repeats after each app update, though an update
+              needs far less room because what is already unpacked counts toward
+              it.
+            </p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h3>Pick your languages</h3>
+            <p>
+              Ruby, Java&nbsp;21 and C/C++ are offered once, and can be added
+              or removed later from the app icon's long-press menu.
+            </p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h3>Open a folder and work</h3>
+            <p>
+              Use the app's projects directory, or open a folder from device
+              storage. The terminal starts where the editor is.
+            </p>
+          </div>
+        </li>
+      </ol>
+      <p style="margin-top:2.25rem">
+        <a class="btn btn-ghost" href="guide.html">Read the user guide</a>
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <h2>A look around</h2>
+      <p class="section-intro">
+        Screenshots from a phone, at the size a phone actually shows them.
+      </p>
+      <ul class="shots">
+        <li class="shot">
+          <figure>
+            <img src="assets/03_code_editor.png" alt="A source file open in the editor with syntax highlighting."
+                 width="350" height="780" loading="lazy">
+            <figcaption>The editor</figcaption>
+          </figure>
+        </li>
+        <li class="shot">
+          <figure>
+            <img src="assets/02_terminal.png" alt="A bash prompt running in the integrated terminal."
+                 width="350" height="780" loading="lazy">
+            <figcaption>The terminal</figcaption>
+          </figure>
+        </li>
+        <li class="shot">
+          <figure>
+            <img src="assets/05_explorer.png" alt="The file explorer showing a project tree."
+                 width="350" height="780" loading="lazy">
+            <figcaption>The explorer</figcaption>
+          </figure>
+        </li>
+        <li class="shot">
+          <figure>
+            <img src="assets/04_extensions.png" alt="The extensions view, listing the extensions installed."
+                 width="350" height="780" loading="lazy">
+            <figcaption>Extensions</figcaption>
+          </figure>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section section-sunken">
+    <div class="wrap">
+      <div class="prose">
+        <h2>Worth knowing before you start</h2>
+        <p class="section-intro">
+          Android is not a desktop, and a few things follow from that. The user
+          guide covers each in full.
+        </p>
+      </div>
+      <ul class="features">
+        <li class="feature">
+          <h3>No C compiler until you add one</h3>
+          <p>
+            Packages that build native code at install time fail until the
+            C/C++ toolchain is added from the toolchains screen. With it, pip
+            compiles a package's C extension; node-gyp builds have not been
+            tried, so a pure JavaScript alternative is the reliable route. Pure
+            JavaScript and pure Python packages are fine, and pip is pointed at
+            prebuilt Android builds of NumPy, pandas, pydantic-core and psutil,
+            so those install without it.
+          </p>
+        </li>
+        <li class="feature">
+          <h3>Tools start indirectly</h3>
+          <p>
+            Android refuses to execute files in an app's private storage, so a
+            toolchain's commands are reached through a small launcher on PATH.
+            Typing them, running them from a task and extensions spawning them
+            all work; <code>pip</code> and <code>npm</code> are shell functions,
+            so a task has to spell those as <code>python3 -m pip</code>.
+          </p>
+        </li>
+        <li class="feature">
+          <h3>Some extensions cannot work</h3>
+          <p>
+            An extension that ships a compiled desktop Linux binary installs
+            without complaint and then does nothing. The JavaScript ones are the
+            overwhelming majority.
+          </p>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="footer-grid">
+      <div>
+        <a class="brand" href="./">
+          <img src="assets/vscodroid.png" alt="" width="128" height="128">
+          VSCodroid
+        </a>
+      </div>
+      <nav class="footer-links" aria-label="Footer">
+        <a href="guide.html">User guide</a>
+        <a href="privacy-policy.html">Privacy policy</a>
+        <a href="https://github.com/Amixuai/Vscoderoid-Pro">Source</a>
+        <a href="https://github.com/Amixuai/Vscoderoid-Pro/releases">Releases</a>
+        <a href="https://github.com/Amixuai/Vscoderoid-Pro/issues">Report an issue</a>
+      </nav>
+    </div>
+    <p class="disclaimer">
+      VSCodroid is not affiliated with or endorsed by Microsoft Corporation.
+      "Visual Studio Code" and "VS Code" are trademarks of Microsoft. Built from
+      the MIT-licensed Code&nbsp;-&nbsp;OSS source code, and using the Open VSX
+      extension registry rather than the Microsoft Marketplace.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
