@@ -93,7 +93,7 @@ VSCodroid is NOT a cloud IDE, a Termux wrapper, or a custom editor. It is the ac
 |----|------------|----------|-----------|
 | FR-FS-01 | System SHALL provide a file explorer panel showing workspace files | P0 | M1 |
 | FR-FS-02 | System SHALL support create, rename, delete, move operations on files and folders | P0 | M1 |
-| FR-FS-03 | System SHALL default the workspace to `filesDir/projects`, internal storage, on a new install, and SHALL keep `getExternalFilesDir(null)/projects` for an install that already has that directory or whose `~/projects` link points there (`Environment.getProjectsDir`). Shared storage cannot hold a symbolic link, which broke `npm install` there. Both are app-private in the sense that matters here, no storage permission reaches either; both are wiped by Clear Data, and the shared-storage one is reachable over MTP on some devices | P0 | M0 |
+| FR-FS-03 | System SHALL default the workspace to `/storage/emulated/0/.VScoderoid-Pro` (public storage, hidden by its leading dot, holding `.nomedia`) when All files access is granted (`PublicWorkspace`, `Environment.getProjectsDir`), SHALL recreate `.nomedia` if it is deleted, and SHALL restore the dot to a `VScoderoid-Pro` folder that holds `.nomedia`. When the permission is not granted the older rule applies: default to `filesDir/projects`, internal storage, on a new install, and keep `getExternalFilesDir(null)/projects` for an install that already has that directory or whose `~/projects` link points there (`Environment.getProjectsDir`). Shared storage cannot hold a symbolic link, which broke `npm install` there. Both are app-private in the sense that matters here, no storage permission reaches either; both are wiped by Clear Data, and the shared-storage one is reachable over MTP on some devices | P0 | M0 |
 | FR-FS-04 | System SHALL support opening folders as workspace root | P0 | M1 |
 | FR-FS-05 | System SHALL support multi-root workspaces. A `.code-workspace` opens, survives a relaunch and is written back when it sits in a device folder (`workbenchTarget`, `workbenchUrl`, `MainActivity`). Two limits are deliberate and neither is a defect to file: the Android picker cannot select one, because it is `ACTION_OPEN_DOCUMENT_TREE` and that returns a directory only; and roots spanning two device folders are not synchronised, because exactly one folder is watched at a time (`watchedSafFolder`, `SafSyncEngine.startWatching`). No guard is written for the second, and that is measured rather than assumed: a root the workspace lists outside the granted folder does not resolve, and the workbench draws it in the warning colour with a `!`, so the failure is on screen rather than silent. This row read as unqualified until 2026-08-30, when the shell could not name a workspace at all | P2 | M2 |
 | FR-FS-06 | System SHOULD support accessing files from external storage via SAF | P2 | M4 |
@@ -267,7 +267,7 @@ VSCodroid is NOT a cloud IDE, a Termux wrapper, or a custom editor. It is the ac
 | NFR-SEC-01 | All binaries signed in APK | Verified at install | P0 |
 | NFR-SEC-02 | No telemetry sent to external services | Microsoft telemetry stripped | P0 |
 | NFR-SEC-03 | Server listens on localhost only | No external network exposure | P0 |
-| NFR-SEC-04 | App-private storage for workspace | Android sandbox enforced | P0 |
+| NFR-SEC-04 | Workspace on public storage under All files access; settings, secrets and tools in app-private storage | Permission granted by the user on the system screen; private data stays inside the Android sandbox | P0 |
 | NFR-SEC-05 | Every binary the app installs is delivered by Play on a Play install; the app never downloads executable code for itself | Core as .so in base APK; toolchains as on-demand asset packs via Language Picker. A non-Play install fetches the same toolchain ZIPs over HTTPS from GitHub Releases, against a published sha256 manifest | P0 |
 | NFR-SEC-06 | Extension sandbox | Extensions run in Extension Host only | P1 |
 
@@ -369,7 +369,7 @@ Detailed in [API Spec § Android Bridge API](./05-API_SPEC.md#2-a-android-bridge
 
 | Data | Location | Backup |
 |------|----------|--------|
-| User workspace files | App-private storage or SAF-accessed external | User responsibility |
+| User workspace files | `/storage/emulated/0/.VScoderoid-Pro` (public storage), or any folder the user picks | User responsibility |
 | VS Code settings | App-private storage / .vscodroid/ | Sync via Settings Sync extension |
 | Installed extensions | App-private storage | Re-downloadable |
 | Git config & SSH keys | App-private storage ~/ | User responsibility |

@@ -6,6 +6,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Bundle
 import android.webkit.WebView
+import com.vscodroid.storage.PublicWorkspace
 import com.vscodroid.util.CrashReporter
 import com.vscodroid.util.Logger
 
@@ -16,6 +17,12 @@ class VSCodroidApp : Application() {
         WebView.setDataDirectorySuffix("vscodroid")
         Logger.init(this)
         CrashReporter.init(this)
+
+        // Keeps /storage/emulated/0/.VScoderoid-Pro and its .nomedia in place for
+        // as long as this process lives (recreates a deleted .nomedia at once, and
+        // gives the dot back to a folder renamed without it). Does nothing until
+        // all-files access is granted, and starts working the moment it is.
+        PublicWorkspace.startGuard()
 
         // Pre-warm: loading the Chromium library is the slowest part of
         // WebView creation (~200-400ms). Creating and immediately destroying

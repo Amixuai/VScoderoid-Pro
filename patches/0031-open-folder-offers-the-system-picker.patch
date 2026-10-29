@@ -9,17 +9,19 @@ remote indicator menu and the empty Explorer reached it. The File menu, Ctrl+K C
 palette's own Open Folder and the Explorer's Open Folder button all end in pickFolderAndOpen,
 and each of them showed the typed dialog.
 
-pickFolderAndOpen now asks which one is meant when the page runs on Android and the command
-is registered. "On the device" runs the picker, "In the app's storage" continues to the typed
-dialog exactly as before, and dismissing the question does nothing. Open in a new window keeps
-the typed dialog, because the picker opens its folder in the current window. Add Folder to
-Workspace, Save As and Open File do not go through this function and are untouched.
+pickFolderAndOpen now runs the picker straight away when the page runs on Android and the
+command is registered: no question, and no way into the typed dialog. The app keeps the user's
+work on public storage (/storage/emulated/0/.VScoderoid-Pro) and opens any other folder through
+the system picker, so a dialog that browses the app's private storage has nothing to offer. Open
+in a new window keeps the typed dialog, because the picker opens its folder in the current
+window. Add Folder to Workspace, Save As and Open File do not go through this function and are
+untouched.
 
 The command is registered once the bundled extension has activated, which is a few seconds
 after a page loads. Until then, and when the extension is missing, the typed dialog shows
 alone, as it did before. That check is load-bearing: executeCommand on an id that nothing
-registered waits up to 30 seconds for an activation event before it rejects. A question that
-cannot be shown, or a command that fails, falls back to the typed dialog and logs a warning.
+registered waits up to 30 seconds for an activation event before it rejects. A command that
+fails falls back to the typed dialog and logs a warning.
 
 diff --git a/src/vs/workbench/services/dialogs/browser/fileDialogService.ts b/src/vs/workbench/services/dialogs/browser/fileDialogService.ts
 index 4a519ac..6d7ede5 100644
@@ -48,15 +50,15 @@ index 4a519ac..6d7ede5 100644
  		const schema = this.getFileSystemSchema(options);
  
  		if (!options.defaultUri) {
-@@ -96,6 +105,42 @@ export class FileDialogService extends AbstractFileDialogService implements IFil
+@@ -96,6 +105,27 @@ export class FileDialogService extends AbstractFileDialogService implements IFil
  		throw new Error(localize('pickFolderAndOpen', "Can't open folders, try adding a folder to the workspace instead."));
  	}
  
 +	/**
-+	 * The dialog below types a path into the app's own storage, where a folder in the phone's
-+	 * shared storage (Documents, Download, an SD card) shows no files: Android hides what other
-+	 * apps saved there from a path, and only the system picker grants access. So ask which one
-+	 * is meant. Resolves true once the picker took over or the question was dismissed.
++	 * The dialog below types a path into the app's own storage. On Android that is never where
++	 * the user's code lives: the workspace is on public storage and any other folder comes from
++	 * the system picker, which grants access to it. So always run the picker, with no question
++	 * and no way into the typed dialog. Resolves true once the picker has been started.
 +	 */
 +	private async openFolderFromDevice(): Promise<boolean> {
 +		if (!CommandsRegistry.getCommand(OPEN_FOLDER_FROM_DEVICE)) {
@@ -64,25 +66,10 @@ index 4a519ac..6d7ede5 100644
 +		}
 +
 +		try {
-+			const { result } = await this.dialogService.prompt<boolean | undefined>({
-+				type: Severity.Info,
-+				message: localize('openFolderWhere', "Where is the folder?"),
-+				detail: localize('openFolderWhereDetail', "A folder in Documents, Download or on an SD card needs the system picker to show all of its files."),
-+				buttons: [
-+					{ label: localize('openFolderOnDevice', "On the device"), run: () => true },
-+					{ label: localize('openFolderInApp', "In the app's storage"), run: () => false }
-+				],
-+				cancelButton: { run: () => undefined }
-+			});
-+
-+			if (result) {
-+				await this.commandService.executeCommand(OPEN_FOLDER_FROM_DEVICE);
-+			}
-+
-+			return result !== false;
++			await this.commandService.executeCommand(OPEN_FOLDER_FROM_DEVICE);
++			return true;
 +		} catch (error) {
-+			// A question that cannot be shown, or a picker that cannot be started, must not take
-+			// the path dialog away: it is the way into the app's own storage.
++			// A picker that cannot be started must not leave Open Folder with no dialog at all.
 +			this.logService.warn('[FileDialogService] Open Folder from Device failed, using the path dialog', error);
 +			return false;
 +		}

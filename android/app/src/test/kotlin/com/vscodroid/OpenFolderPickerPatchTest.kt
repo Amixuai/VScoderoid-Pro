@@ -59,10 +59,10 @@ class OpenFolderPickerPatchTest {
     }
 
     @Test
-    fun `the prompt is Android only and leaves the typed dialog reachable`() {
+    fun `the picker is Android only and runs only a command that is registered`() {
         assertTrue(
             addedLines.contains("isAndroid && !options.forceNewWindow"),
-            "the prompt must not appear off Android, and not for Open in a new window, " +
+            "the picker must not run off Android, and not for Open in a new window, " +
                 "which the picker cannot do",
         )
         assertTrue(
@@ -70,28 +70,26 @@ class OpenFolderPickerPatchTest {
             "executeCommand on an unregistered id waits up to 30 seconds for an activation " +
                 "event, so the command has to be checked first",
         )
+    }
+
+    @Test
+    fun `Open Folder starts the picker with no question in front of it`() {
         assertTrue(
-            addedLines.contains("run: () => false }"),
-            "the second button must fall through to the typed dialog, the only way into the " +
-                "app's own storage",
+            addedLines.contains("await this.commandService.executeCommand(OPEN_FOLDER_FROM_DEVICE);"),
+            "Open Folder must run the system picker directly",
+        )
+        assertTrue(
+            !addedLines.contains("dialogService.prompt") && !addedLines.contains("openFolderInApp"),
+            "the question that offered the app's private storage is gone for good: the " +
+                "workspace is on public storage and every other folder comes from the picker",
         )
     }
 
     @Test
-    fun `dismissing the question does nothing and a failure falls back to the typed dialog`() {
-        assertTrue(
-            addedLines.contains("cancelButton: { run: () => undefined }"),
-            "dismissing the question must answer undefined, which is neither choice",
-        )
-        assertTrue(
-            addedLines.contains("return result !== false;"),
-            "only the second button (false) may continue to the typed dialog: undefined is a " +
-                "dismissal, and `!!result` would open the dialog the user just backed out of",
-        )
+    fun `a picker that cannot be started falls back to the typed dialog`() {
         assertTrue(
             addedLines.contains("} catch (error) {") && addedLines.contains("return false;"),
-            "a question that cannot be shown, or a command that fails, must not leave Open " +
-                "Folder with no dialog at all",
+            "a command that fails must not leave Open Folder with no dialog at all",
         )
     }
 }

@@ -160,6 +160,8 @@ class SplashActivity : AppCompatActivity() {
         // reading as present to every check, until the next app update. The
         // terminal starts there.
         repair("the projects symlink") { setup.createStorageSymlinks() }
+        // And the shell's own copy of the answer, which .bashrc bakes in once.
+        repair("the PROJECTS_DIR export") { setup.syncProjectsDirExport() }
         // Older versions dropped a README.md into the workspace on every
         // install; take out untouched copies so projects start clean.
         repair("the legacy welcome README") { setup.removeLegacyWelcomeReadme() }

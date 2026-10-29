@@ -23,12 +23,17 @@ VSCodroid runs a local code editor server entirely on your Android device. The e
 
 All code execution -- whether Node.js, Python, Bash, or any other bundled runtime -- happens 100% on your device.
 
-The app asks for four Android permissions of its own. `INTERNET` covers the
+The app asks for five Android permissions of its own. `INTERNET` covers the
 user-initiated cases listed under **Network Access** below, and the loopback
 traffic between the editor page and the local server. `FOREGROUND_SERVICE` and
 `FOREGROUND_SERVICE_SPECIAL_USE` keep that local server alive while you are
 working. `POST_NOTIFICATIONS` is for the notification showing the server's
-status.
+status. `MANAGE_EXTERNAL_STORAGE` ("All files access", which you grant on the
+system settings screen) lets the editor keep your projects in a folder on shared
+storage, `/storage/emulated/0/.VScoderoid-Pro`, and open any folder you choose
+with Android's folder picker, so your code is not locked inside the app's private
+storage. The app reads and writes only the folders you open and its own
+workspace folder, and sends none of it anywhere.
 
 Two more are added by libraries the app is built with, and the Play listing
 shows that merged set rather than ours, so they are named here as well.

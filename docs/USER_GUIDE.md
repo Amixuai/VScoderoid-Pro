@@ -33,11 +33,11 @@ A practical guide to using VSCodroid -- the full VS Code IDE running natively on
 
 | Item | Path |
 |------|------|
-| Projects folder | `~/projects/` |
+| Projects folder | `/storage/emulated/0/.VScoderoid-Pro` (also reachable as `~/projects/`). Without All files access: `~/projects/` in the app's private storage |
 | Settings and data | `~/.vscodroid/` |
 | SSH keys | `~/.ssh/` |
 
-All files are stored in the app's private sandbox. No root access is required.
+Your projects are stored on public storage, in `/storage/emulated/0/.VScoderoid-Pro`, which needs the **All files access** permission. VSCodroid asks for it because the editor server and terminal work with real file paths, and Android gives an app real paths on shared storage only with that permission. It is used for the workspace folder and for folders you pick, and nothing is uploaded. Settings, tools and extensions stay in the app's private storage. No root access is required.
 
 ---
 
@@ -47,17 +47,17 @@ VSCodroid is VS Code. If you have used VS Code on desktop, everything works the 
 
 ### Opening Files and Folders
 
-- **File > Open Folder**, Ctrl+K Ctrl+O and the Explorer's Open Folder button ask
-  whether the folder is **On the device** or **In the app's storage**. Choose the
-  second for projects inside the app: it opens a dialog that takes a path.
-  Typing a path such as `/storage/emulated/0/...` or `/sdcard/...` into that
-  dialog reaches Documents, Downloads or an SD card, but VSCodroid holds no
-  storage permission, so Android shows it the folders there and hides every file
-  another app saved in them. Such a folder opens with its subfolders and none of
-  those files; the editor then says so in a dialog, once per folder each time its
-  server starts rather than on every reload, and offers the route below.
-- For a folder anywhere else on the device, choose **On the device** in that
-  question, or run **VSCodroid: Open Folder from Device**: tap the remote
+- **File > Open Folder**, Ctrl+K Ctrl+O and the Explorer's Open Folder button open
+  Android's own folder picker, which starts inside the app's workspace folder,
+  `/storage/emulated/0/.VScoderoid-Pro`. Pick that folder, create a new one in it, or
+  go anywhere else on the device. The folder opens in place, by its real path, so what
+  you save is what is on your phone. The first time, Android sends you to the **All
+  files access** screen; switch it on for VSCodroid, because the workspace needs it.
+- The workspace folder starts with a dot so file managers and name searches do not
+  show it, and holds a `.nomedia` file so Gallery and other apps do not scan it. If
+  `.nomedia` is deleted the app puts it back; if the dot is removed from the folder's
+  name the app puts it back too, provided `.nomedia` is still inside.
+- To open a folder anywhere else on the device, run **VSCodroid: Open Folder from Device**: tap the remote
   indicator at the left end of the status bar, tap the button in the empty
   Explorer, or use the Command Palette. It opens Android's folder picker; pick
   the folder and allow access, and the files other apps saved in it show as

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The workspace now lives on public storage, in `/storage/emulated/0/.VScoderoid-Pro`, so your code is not locked inside the app's private storage and survives Clear Data and an uninstall. This needs Android's **All files access** permission (`MANAGE_EXTERNAL_STORAGE`), which the app asks for once on launch; without it the workspace stays in the app's private storage as before.
+- The workspace folder is hidden by its leading dot and holds a `.nomedia` file so gallery and media apps do not scan it. The app puts `.nomedia` back if it is deleted, and puts the dot back on a `VScoderoid-Pro` folder that still holds `.nomedia`.
 - A play button in the editor's title bar runs the open JavaScript, TypeScript, Ruby, Java, C, C++, `.sh` or `.bash` file in a terminal, as Python files already had.
 - Running a Ruby, Java, C or C++ file whose toolchain is not installed offers the toolchains screen.
 - A finger can drag the caret: touch it or just under it and drag sideways, and it follows, with the text scrolling at the editor's edge. A drag that starts up or down, or with text selected, scrolls as before.
@@ -16,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The Get Started walkthrough has two more steps, after the theme: opening a folder from the phone's storage and running a file.
-- On Android, File > Open Folder, Ctrl+K Ctrl+O and the Explorer's Open Folder button ask whether the folder is on the device (Android's picker) or in the app's storage (the path dialog).
+- On Android, File > Open Folder, Ctrl+K Ctrl+O and the Explorer's Open Folder button open Android's folder picker directly, starting in the workspace folder. The question about the app's storage, and the path dialog behind it, are gone from these routes.
+- With All files access, a folder picked in Android's picker opens in place by its real path, with no private copy to sync. Without it, or for a folder on a cloud provider, the copy that is synced back still applies.
+- Privacy policy and security documents now name the All files access permission and say what it is used for.
 - The Java toolchain is OpenJDK 21 instead of 17: 64 MB to download and 186 MB installed, up from 56.5 and 160. A Java 17 installed earlier keeps working until it is removed and installed again.
 
 ### Fixed

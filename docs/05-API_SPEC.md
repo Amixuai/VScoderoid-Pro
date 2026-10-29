@@ -371,9 +371,12 @@ fun openFolderPicker(authToken: String)
 
 There is no `openFilePicker` and no `requestStoragePermission`. Individual files are
 not opened through a picker at all: a `content://` URI has no POSIX path and the
-server only ever sees POSIX paths. And there is no `MANAGE_EXTERNAL_STORAGE` in the
-manifest to request: external storage is reached through SAF, one user-granted folder
-at a time.
+server only ever sees POSIX paths. The manifest declares `MANAGE_EXTERNAL_STORAGE`
+(All files access), which the user grants on the system screen; `MainActivity` sends them
+there once per launch (`ensurePublicWorkspace`). With it, a folder returned by the picker is
+opened by its real path (`PublicWorkspace.directFolderFor`). Without it, or for a provider
+that is not the device's own storage, external storage is reached through SAF, one
+user-granted folder at a time.
 
 #### Saving a Download
 

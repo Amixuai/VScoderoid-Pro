@@ -117,7 +117,7 @@ A protocol where one process calls functions in another process over a communica
 ### S
 
 **SAF (Storage Access Framework)**
-Android's mechanism for accessing files outside an app's private directory. Uses system file picker UI. An alternative to broad storage permissions.
+Android's mechanism for accessing files outside an app's private directory. Uses system file picker UI. An alternative to broad storage permissions. VSCodroid uses it as the fallback when All files access is not granted.
 
 **Sideloading**
 Installing an APK outside Google Play (for example from GitHub Releases). There is no separate sideload variant, `android/app/build.gradle.kts` declares no product flavors, and no build bundles a toolchain. What differs is how toolchains arrive, `ToolchainManager` reads the installing package name at runtime and falls back from Play Asset Delivery to an HTTPS download from GitHub Releases when the installer was not Play.

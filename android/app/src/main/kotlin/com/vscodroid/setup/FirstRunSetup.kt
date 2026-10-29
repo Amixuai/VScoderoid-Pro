@@ -2,6 +2,7 @@ package com.vscodroid.setup
 
 import android.content.Context
 import android.system.Os
+import com.vscodroid.storage.PublicWorkspace
 import com.vscodroid.BuildConfig
 import com.vscodroid.R
 import com.vscodroid.util.Environment
@@ -695,6 +696,11 @@ class FirstRunSetup(
      * answers yes to the second question and is no more usable than nothing.
      */
     fun ensureProjectsDir(): String {
+        // The public workspace has its own repair, and it must run first: it gives
+        // the dot back to a `VScoderoid-Pro` folder the user renamed, which only
+        // works while `.VScoderoid-Pro` does not exist yet, and the mkdirs below
+        // would be the thing that made it exist. It also puts `.nomedia` in place.
+        if (PublicWorkspace.hasAllFilesAccess()) PublicWorkspace.ensure()
         val dir = File(Environment.getProjectsDir(context))
         if (!dir.isDirectory) {
             if (dir.mkdirs()) {
@@ -2920,6 +2926,31 @@ claude() {
             Os.symlink(projectsDir, link.absolutePath)
         } catch (e: Exception) {
             Logger.d(tag, "Failed to create projects symlink: ${e.message}")
+        }
+    }
+
+    /**
+     * Keeps the `export PROJECTS_DIR=...` line in `.bashrc` equal to where
+     * [Environment.getProjectsDir] says the workspace is.
+     *
+     * `.bashrc` is written once, with whatever the answer was then, and it runs
+     * after the server's own environment, so an install that began on private
+     * storage keeps starting terminals there even after the workspace has moved to
+     * `/storage/emulated/0/.VScoderoid-Pro`. Only that one line is touched, and only
+     * when it differs; anything else in the file is the user's and stays as it is.
+     * Cheap when there is nothing to do (one read), so it runs on every launch.
+     */
+    fun syncProjectsDirExport() {
+        val bashrc = File(context.filesDir, "home/.bashrc")
+        if (!bashrc.isFile) return
+        val wanted = "export PROJECTS_DIR='${Environment.getProjectsDir(context)}'"
+        val text = try { bashrc.readText() } catch (e: IOException) { return }
+        val line = Regex("(?m)^export PROJECTS_DIR=.*$")
+        val current = line.find(text)?.value ?: return
+        if (current == wanted) return
+        val updated = line.replaceFirst(text, java.util.regex.Matcher.quoteReplacement(wanted))
+        if (writeAtomically(bashrc) { it.write(updated.toByteArray()) }) {
+            Logger.i(tag, "Pointed PROJECTS_DIR in .bashrc at the current workspace")
         }
     }
 

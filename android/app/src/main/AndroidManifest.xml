@@ -12,6 +12,14 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
+    <!-- All-files access: the workspace lives on public shared storage at
+         /storage/emulated/0/.VScoderoid-Pro, and any folder the user picks is
+         opened by its real path rather than through a private copy. The user
+         grants it on the system "All files access" screen. See PublicWorkspace. -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
     <!-- Notifications: server status in notification shade -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 

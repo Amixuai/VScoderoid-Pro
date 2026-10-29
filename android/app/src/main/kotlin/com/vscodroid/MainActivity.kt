@@ -74,6 +74,7 @@ import com.vscodroid.service.StartupNotice
 import com.vscodroid.setup.FirstRunSetup
 import com.vscodroid.setup.ToolchainManager
 import com.vscodroid.storage.FolderBusyException
+import com.vscodroid.storage.PublicWorkspace
 import com.vscodroid.storage.SafFolderInfo
 import com.vscodroid.storage.SafStorageManager
 import com.vscodroid.util.Logger
@@ -440,6 +441,19 @@ class MainActivity : AppCompatActivity() {
     ) { uri ->
         uri?.let { handleSafFolderSelected(it) }
     }
+
+    /**
+     * The system "All files access" screen. The workspace lives on public storage
+     * (see [PublicWorkspace]), and that needs this one permission, which Android
+     * only lets the user grant there. The result carries nothing, so it is read
+     * back with [PublicWorkspace.hasAllFilesAccess].
+     */
+    private val allFilesAccessLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { onAllFilesAccessAnswered() }
+
+    /** Asked once per process, so declining is not nagged about on every resume. */
+    private var askedForAllFilesAccess = false
 
     /**
      * The device file picker behind `<input type=file>`, which is what the
@@ -1156,8 +1170,62 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        ensurePublicWorkspace()
         handleResumeFromBackground()
         refreshToolchainCommands()
+    }
+
+    /**
+     * Makes sure the public workspace exists and the permission it needs is held.
+     *
+     * Without all-files access the user is taken, once per launch, to the system
+     * screen where it is switched on. With it, the folder and its `.nomedia` are
+     * created (or repaired) off the main thread.
+     */
+    private fun ensurePublicWorkspace() {
+        if (PublicWorkspace.hasAllFilesAccess()) {
+            lifecycleScope.launch(Dispatchers.IO) { PublicWorkspace.ensure() }
+            return
+        }
+        if (askedForAllFilesAccess) return
+        askedForAllFilesAccess = true
+        for (intent in PublicWorkspace.allFilesAccessIntents(this)) {
+            try {
+                allFilesAccessLauncher.launch(intent)
+                return
+            } catch (e: ActivityNotFoundException) {
+                Logger.w(tag, "No all-files-access screen for ${intent.action}", e)
+            }
+        }
+    }
+
+    /**
+     * The user is back from the all-files-access screen.
+     *
+     * Granted: create the folder, repoint everything that remembers the workspace
+     * (`~/projects`, the `PROJECTS_DIR` line in `.bashrc`) and open the folder, as
+     * the editor was started against the old, private location.
+     */
+    private fun onAllFilesAccessAnswered() {
+        if (!PublicWorkspace.hasAllFilesAccess()) {
+            Logger.i(tag, "All-files access was not granted; keeping the private workspace")
+            return
+        }
+        lifecycleScope.launch {
+            val root = withContext(Dispatchers.IO) {
+                PublicWorkspace.ensure()
+                val setup = FirstRunSetup(applicationContext)
+                setup.ensureProjectsDir()
+                setup.createStorageSymlinks()
+                setup.syncProjectsDirExport()
+                PublicWorkspace.root().absolutePath
+            }
+            if (serverPort > 0 && nodeService?.isServerReady() == true &&
+                openWorkspaceFolder.let { it == null || !it.startsWith(PublicWorkspace.sharedRoot().path) }
+            ) {
+                navigateToFolder(serverPort, root)
+            }
+        }
     }
 
     /**
@@ -1228,7 +1296,9 @@ class MainActivity : AppCompatActivity() {
         // here on the main thread, and an uncaught throw ends the process with the
         // server in it.
         try {
-            folderPickerLauncher.launch(null)
+            // Starts in /storage/emulated/0/.VScoderoid-Pro, so the user lands on the
+            // app's own folder and can pick it or navigate anywhere else.
+            folderPickerLauncher.launch(PublicWorkspace.initialPickerUri())
         } catch (e: ActivityNotFoundException) {
             Logger.w(tag, "No document tree picker on this device", e)
         }
@@ -1301,7 +1371,49 @@ class MainActivity : AppCompatActivity() {
      * 2. Syncs folder contents to a local mirror (with progress dialog)
      * 3. Reloads VS Code with the mirror path
      */
-    private fun handleSafFolderSelected(uri: Uri) = openSafFolder(uri, navigate = true)
+    private fun handleSafFolderSelected(uri: Uri) {
+        // With all-files access a folder on the device's own storage is opened by
+        // its real path: no private mirror, no copy, what the editor saves is what
+        // is on the phone. Without it (or for a provider that is not the device's
+        // storage, such as a cloud drive) the SAF mirror route below still applies.
+        // The stat is off the main thread, which MainThreadWatch would flag.
+        lifecycleScope.launch {
+            val direct = withContext(Dispatchers.IO) { PublicWorkspace.directFolderFor(uri) }
+            if (direct != null) openPublicFolder(direct) else openSafFolder(uri, navigate = true)
+        }
+    }
+
+    /**
+     * Opens a folder of the device's own storage in place, by its real path.
+     *
+     * Takes the same lock as [openSafFolder] so the two cannot interleave, and stops
+     * any mirror watcher first: a watcher left on the previous SAF folder would keep
+     * pushing a copy's changes to a folder the user has since left.
+     */
+    private fun openPublicFolder(dir: File) {
+        Logger.i(tag, "Opening the device folder ${dir.name} in place")
+        lifecycleScope.launch {
+            deviceFolderOpens.lock()
+            try {
+                withContext(Dispatchers.IO) { safManager.stopFileWatcher() }
+                watchedSafFolder = null
+                val target = withContext(Dispatchers.IO) {
+                    folderOpenTarget(dir.absolutePath, dir.list()?.asList().orEmpty())
+                }
+                if (serverPort > 0 && nodeService?.isServerReady() == true) {
+                    navigateToFolder(serverPort, target)
+                } else {
+                    // Same as the mirror route: remember it and let the server's
+                    // readiness load it, rather than showing a connection error.
+                    Logger.i(tag, "The server is not serving; opening the folder once it is")
+                    rememberWorkspaceFolder(target)
+                    retryServerStart()
+                }
+            } finally {
+                deviceFolderOpens.unlock()
+            }
+        }
+    }
 
     /**
      * Syncs a device folder down, starts watching it, and points the editor at it.

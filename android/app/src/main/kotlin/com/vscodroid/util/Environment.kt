@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.system.Os
 import com.vscodroid.setup.ToolchainManager
+import com.vscodroid.storage.PublicWorkspace
 import java.io.File
 import java.security.MessageDigest
 
@@ -358,6 +359,13 @@ object Environment {
      * through the SAF picker. Neither of those changed with the location.
      */
     fun getProjectsDir(context: Context): String {
+        // Public storage first. With all-files access the workspace is
+        // /storage/emulated/0/.VScoderoid-Pro, never the app's private sandbox,
+        // so the user's code survives Clear Data and an uninstall. Everything
+        // below is the fallback for a device where that access has not been
+        // granted (yet), and for the JVM tests, where the call answers false.
+        if (PublicWorkspace.hasAllFilesAccess()) return PublicWorkspace.root().absolutePath
+
         val filesDir = context.filesDir.absolutePath
         val internal = "$filesDir/projects"
         val externalDir = context.getExternalFilesDir(null) ?: return internal
