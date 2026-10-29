@@ -128,10 +128,12 @@ verbatim; `docs/LEGAL_NOTICES.md` records which text covers which component.
 | OpenSSH | BSD | bundled tool in its own right |
 | OpenSSL | Apache-2.0 | Git, Node.js, OpenSSH, OpenSSL, Python, ldns, libcrypt, libcurl, libssh2, ngtcp2 |
 | PCRE2 | BSD-3-Clause | Git |
+| PRoot | GPL-2.0 | bundled tool in its own right (Desktop Mode) |
 | Python | PSF-2.0 | Python |
 | readline | GPL-3.0 | Bash, Python |
 | ripgrep | MIT | bundled tool in its own right |
 | SQLite | Public Domain | Node.js, Python |
+| talloc | LGPL-3.0 | PRoot |
 | termux-exec | Apache-2.0, MIT, BSD-3-Clause, GPL-2.0-only WITH Classpath-exception-2.0 | preloaded into every terminal; built here from upstream source, https://github.com/termux/termux-exec-package |
 | tmux | ISC | bundled tool in its own right |
 | utf8proc | MIT | tmux |

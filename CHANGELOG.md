@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PRoot and its loader are now packaged with the app (`libproot.so`, `libproot-loader.so`, plus `libtalloc.so.2`), and `proot` is available in the terminal. This is the first step of an optional Desktop Mode that will run a Debian system without root; nothing in the editor changes yet.
 - The workspace now lives on public storage, in `/storage/emulated/0/.VScoderoid-Pro`, so your code is not locked inside the app's private storage and survives Clear Data and an uninstall. This needs Android's **All files access** permission (`MANAGE_EXTERNAL_STORAGE`), which the app asks for once on launch; without it the workspace stays in the app's private storage as before.
 - The workspace folder is hidden by its leading dot and holds a `.nomedia` file so gallery and media apps do not scan it. The app puts `.nomedia` back if it is deleted, and puts the dot back on a `VScoderoid-Pro` folder that still holds `.nomedia`.
 - A play button in the editor's title bar runs the open JavaScript, TypeScript, Ruby, Java, C, C++, `.sh` or `.bash` file in a terminal, as Python files already had.

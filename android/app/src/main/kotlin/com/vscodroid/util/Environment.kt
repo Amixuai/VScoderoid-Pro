@@ -109,6 +109,12 @@ object Environment {
             "TMUX_TMPDIR" to tmpDir,
             "PATH" to path,
             "LD_LIBRARY_PATH" to "$nativeLibDir:$filesDir/usr/lib",
+            // proot runs the programs of a Debian system through its own loader,
+            // which has to be an executable in nativeLibraryDir like proot itself.
+            // PROOT_TMP_DIR is where proot keeps its working files; the default,
+            // /tmp, does not exist on Android.
+            "PROOT_LOADER" to "$nativeLibDir/libproot-loader.so",
+            "PROOT_TMP_DIR" to tmpDir,
             // What the exec interceptor reads to tell the app's own paths from
             // the system's, once a terminal preloads it (see
             // [getExecPreloadPath]). Inert until then: no bundled ELF reads any

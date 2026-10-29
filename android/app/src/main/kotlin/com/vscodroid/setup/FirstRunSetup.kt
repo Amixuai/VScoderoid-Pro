@@ -1406,6 +1406,7 @@ class FirstRunSetup(
             "make" to "libmake.so",
             "ssh" to "libssh.so",
             "ssh-keygen" to "libssh-keygen.so",
+            "proot" to "libproot.so",
         )
 
         var created = 0

@@ -553,10 +553,12 @@ files that carry terms of their own changes.
 | [OpenSSH](https://www.openssh.com) | BSD | no | `libssh-keygen.so`, `libssh.so` |
 | [OpenSSL](https://www.openssl.org) | Apache-2.0 | no | `libcrypto.so.3`, `libssl.so.3` |
 | [PCRE2](https://www.pcre.org) | BSD-3-Clause | no | `libpcre2-8.so` |
+| [PRoot](https://proot-me.github.io) | GPL-2.0 | **yes** | `libproot-loader.so`, `libproot.so` |
 | [Python](https://www.python.org) | PSF-2.0 | no | `libpython.so`, `libpython3.14.so` |
 | [readline](https://tiswww.case.edu/php/chet/readline/rltop.html) | GPL-3.0 | **yes** | `libreadline.so.8` |
 | [ripgrep](https://github.com/BurntSushi/ripgrep) | MIT | no | `libripgrep.so` |
 | [SQLite](https://sqlite.org) | Public Domain | no | `libsqlite3.so` |
+| [talloc](https://talloc.samba.org) | LGPL-3.0 | **yes** | `libtalloc.so.2` |
 | [termux-exec](https://github.com/termux/termux-exec-package) | Apache-2.0, MIT, BSD-3-Clause, GPL-2.0-only WITH Classpath-exception-2.0 | **yes** | `libtermux-exec.so` |
 | [tmux](https://github.com/tmux/tmux) | ISC | no | `libtmux.so` |
 | [utf8proc](https://juliastrings.github.io/utf8proc/) | MIT | no | `libutf8proc.so.3` |
@@ -666,6 +668,8 @@ VSCodroid bundles binaries licensed under the GNU General Public License (GPL). 
 - **Bash** (GPL-3.0): Source available at https://github.com/termux/termux-packages (package: `bash`)
 - **Git** (GPL-2.0): Source available at https://github.com/termux/termux-packages (package: `git`)
 - **GNU Make** (GPL-3.0): Source available at https://github.com/termux/termux-packages (package: `make`)
+- **PRoot** (GPL-2.0): Source available at https://github.com/termux/termux-packages (package: `proot`); it starts the Debian system of Desktop Mode, and its loader is shipped as `libproot-loader.so`
+- **talloc** (LGPL-3.0): Source available at https://github.com/termux/termux-packages (package: `libtalloc`), linked by PRoot
 - **readline** (GPL-3.0): Source available at https://github.com/termux/termux-packages (package: `readline`)
 - **libiconv** (LGPL-2.1 / GPL-3.0): Source available at https://github.com/termux/termux-packages (package: `libiconv`), linked by Bash and by every Git executable
 - **gdbm** (GPL-3.0): Source available at https://github.com/termux/termux-packages (package: `gdbm`), linked by Python's `dbm` and `gdbm` modules
@@ -702,10 +706,10 @@ The offer above is one obligation; a copy of the licence itself is the other. GP
 
 | Licence | Text | Components it covers |
 |---|---|---|
-| GPL-2.0 | `licenses/COPYING.GPLv2` | Git, `git-remote-curl`, Zstandard, xz / liblzma, Java (OpenJDK), termux-exec (its `Canonicalize.c`), the Linux kernel interface headers (C/C++ toolchain pack) |
+| GPL-2.0 | `licenses/COPYING.GPLv2` | Git, `git-remote-curl`, PRoot, Zstandard, xz / liblzma, Java (OpenJDK), termux-exec (its `Canonicalize.c`), the Linux kernel interface headers (C/C++ toolchain pack) |
 | GPL-3.0 | `licenses/COPYING.GPLv3` | Bash, GNU Make, readline, gdbm, libiconv, xz / liblzma |
 | LGPL-2.1 | `licenses/COPYING.LGPLv2.1` | libiconv, xz / liblzma |
-| LGPL-3.0 | `licenses/COPYING.LGPLv3` | GMP (Ruby toolchain pack), libzmq (inside zeromq.js) |
+| LGPL-3.0 | `licenses/COPYING.LGPLv3` | GMP (Ruby toolchain pack), libzmq (inside zeromq.js), talloc |
 
 The first three are the Free Software Foundation's texts as shipped in Termux's `liblzma` package, which is one of the packages this app redistributes. LGPL-3.0 is the FSF's own publication at https://www.gnu.org/licenses/lgpl-3.0.txt, because no Termux package here carries it; libzmq's copy, with its exception appended, also ships beside the zeromq.js addon. All four are verbatim, and `NoticesTest` pins the sha256 of each: a licence text that has been reflowed, re-wrapped or truncated is no longer the licence, so none of them may be edited.
 

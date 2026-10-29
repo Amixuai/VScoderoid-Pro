@@ -57,6 +57,10 @@ REQUIRED_PACKAGES=(
     # Dropping it extinguishes the obligation entirely rather than documenting
     # it, which is both cheaper and less fragile than a written source offer.
     libresolv-wrapper
+    # PRoot, for Desktop Mode: it runs a Debian system without root. libtalloc is
+    # its only library dependency; its loader ships as a separate executable.
+    proot
+    libtalloc
     # Node's own dependencies. It is fetched by download-node.sh, but its
     # libraries belong here: step 5 wipes assets/usr/lib before repopulating it,
     # so anything placed there by a later script would survive only by running
@@ -97,6 +101,7 @@ get_sonames() {
         ldns)              echo "libldns.so" ;;
         krb5)              echo "libgssapi_krb5.so.2 libkrb5.so.3 libk5crypto.so.3 libkrb5support.so.0 libcom_err.so.3" ;;
         libresolv-wrapper) echo "libresolv_wrapper.so" ;;
+        libtalloc)         echo "libtalloc.so.2" ;;
         c-ares)            echo "libcares.so" ;;
         # libicudata is the 32 MB data blob the other two are useless without.
         libicu)            echo "libicui18n.so.78 libicuuc.so.78 libicudata.so.78" ;;
@@ -112,7 +117,7 @@ LIB_PACKAGES=(
     libcurl openssl pcre2 libexpat
     libnghttp2 libnghttp3 libngtcp2 libssh2 zlib
     libevent utf8proc libandroid-glob libedit ldns
-    krb5 libresolv-wrapper
+    krb5 libresolv-wrapper libtalloc
     c-ares libicu libc++ libsqlite
 )
 
@@ -224,6 +229,34 @@ if [ -f "$SSH_KEYGEN_BIN" ]; then
 else
     echo "  ERROR: ssh-keygen binary not found at $SSH_KEYGEN_BIN"
     find "extracted/openssh" -name "ssh-keygen" -type f 2>/dev/null || true
+    exit 1
+fi
+
+# proot and its loader, for Desktop Mode.
+#
+# Both are executables, so both take the .so name and live in jniLibs: SELinux
+# refuses execve on anything under filesDir for targetSdk >= 29. proot starts the
+# programs of a Debian system by running its own loader, which maps each ELF
+# itself instead of asking the kernel to exec it. The loader is the file proot
+# is told about through PROOT_LOADER, so it has to be exec-able from
+# nativeLibraryDir exactly like proot is.
+PROOT_BIN="extracted/proot/data/data/com.termux/files/usr/bin/proot"
+if [ -f "$PROOT_BIN" ]; then
+    cp "$PROOT_BIN" "$JNILIBS_DIR/libproot.so"
+    echo "  libproot.so ($(du -sh "$JNILIBS_DIR/libproot.so" | cut -f1))"
+else
+    echo "  ERROR: proot binary not found at $PROOT_BIN"
+    find "extracted/proot" -name "proot" -type f 2>/dev/null || true
+    exit 1
+fi
+
+PROOT_LOADER_BIN="extracted/proot/data/data/com.termux/files/usr/libexec/proot/loader"
+if [ -f "$PROOT_LOADER_BIN" ]; then
+    cp "$PROOT_LOADER_BIN" "$JNILIBS_DIR/libproot-loader.so"
+    echo "  libproot-loader.so ($(du -sh "$JNILIBS_DIR/libproot-loader.so" | cut -f1))"
+else
+    echo "  ERROR: proot loader not found at $PROOT_LOADER_BIN"
+    find "extracted/proot" -name "loader*" -type f 2>/dev/null || true
     exit 1
 fi
 
@@ -636,7 +669,7 @@ echo "=== Verifying placed binaries ==="
 # verifying earlier would be verifying a directory still being built.
 
 JNILIBS_BINARIES=(libbash.so libgit.so libgit-remote-curl.so libtmux.so libmake.so
-                  libssh.so libssh-keygen.so)
+                  libssh.so libssh-keygen.so libproot.so libproot-loader.so)
 
 verify_failures=0
 verify_checked=0
