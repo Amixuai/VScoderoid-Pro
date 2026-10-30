@@ -214,6 +214,8 @@ VSCodroid/
 │   │   │   │   ├── libldmusl.so          # musl loader (runs the Claude Code CLI)
 │   │   │   │   ├── libclaude-launch.so   # Starts that CLI with the shim preloaded
 │   │   │   │   ├── libseccomp-shim.so    # Answers the syscall Android 14 and earlier refuse
+│   │   │   │   ├── libproot.so           # PRoot, the userspace chroot Desktop Mode runs Debian under
+│   │   │   │   ├── libproot-loader.so    # PRoot's loader, started by the kernel so it lives here too
 │   │   │   │   └── libexec-trampoline.so # Starts a toolchain command (SELinux)
 │   │   │   └── res/                   # Android resources, layouts
 │   │   └── build.gradle.kts

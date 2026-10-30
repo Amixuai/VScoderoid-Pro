@@ -109,6 +109,7 @@ verbatim; `docs/LEGAL_NOTICES.md` records which text covers which component.
 | ldns | BSD-3-Clause | OpenSSH |
 | libandroid-glob | BSD-3-Clause | Kerberos 5, tmux |
 | libandroid-posix-semaphore | MIT | Python |
+| libandroid-shmem | BSD-3-Clause | PRoot |
 | libandroid-support | Apache-2.0, MIT | Bash, Kerberos 5, OpenSSH, Python, readline, tmux |
 | libc++ | NCSA | ICU, Node.js, and the on-demand C/C++ toolchain |
 | libcrypt | BSD-2-Clause | bundled tool in its own right |

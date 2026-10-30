@@ -534,6 +534,7 @@ files that carry terms of their own changes.
 | [ldns](https://www.nlnetlabs.nl/projects/ldns/) | BSD-3-Clause | no | `libldns.so` |
 | [libandroid-glob](https://github.com/termux/libandroid-glob) | BSD-3-Clause | no | `libandroid-glob.so` |
 | [libandroid-posix-semaphore](https://github.com/termux/libandroid-posix-semaphore) | MIT | no | `libandroid-posix-semaphore.so` |
+| [libandroid-shmem](https://github.com/termux/libandroid-shmem) | BSD-3-Clause | no | `libandroid-shmem.so` |
 | [libandroid-support](https://github.com/termux/libandroid-support) | Apache-2.0, MIT | no | `libandroid-support.so` |
 | [libc++](https://libcxx.llvm.org) | NCSA | no | `libc++_shared.so` |
 | [libcrypt](http://michael.dipperstein.com/crypt/) | BSD-2-Clause | no | `libcrypt.so` |
