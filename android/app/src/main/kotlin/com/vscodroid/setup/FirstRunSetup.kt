@@ -557,6 +557,11 @@ class FirstRunSetup(
                 if (!extractAssetFile(script, "server/$script")) incomplete += script
             }
 
+            // Desktop Mode's script. Python reads it as data (the interpreter is what
+            // the kernel runs), so it can sit under filesDir, and it goes beside the
+            // user's home so `python3 ~/.vscodroid/desktop.py` is the whole path.
+            if (!extractAssetFile("desktop.py", "home/.vscodroid/desktop.py")) incomplete += "desktop.py"
+
             // The same byte counter, because this step is long enough to read as
             // a hang too: 2,812 files and 110 MiB with the bar pinned at 62 was
             // tens of seconds of nothing moving, which is exactly what the server
