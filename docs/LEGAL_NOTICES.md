@@ -838,3 +838,20 @@ For questions about licenses, trademarks, or legal notices:
 ---
 
 _This document was last updated on October 23, 2026._
+
+## Components downloaded by Desktop Mode
+
+Desktop Mode (experimental) downloads these to the user's device when the user runs its setup. None
+of them is part of the APK, and each stays under its own licence.
+
+| Component | Licence | Source |
+|---|---|---|
+| Debian GNU/Linux (arm64 root file system) | various, see `/usr/share/doc/*/copyright` inside it | https://www.debian.org |
+| VSCodium | MIT | https://github.com/VSCodium/vscodium |
+| TigerVNC | GPL-2.0 | https://github.com/TigerVNC/tigervnc |
+| Openbox | GPL-2.0 | http://openbox.org |
+| noVNC | MPL-2.0 | https://github.com/novnc/noVNC |
+| websockify | LGPL-3.0 | https://github.com/novnc/websockify |
+
+The Debian root file system is taken from the proot-distro project's releases
+(https://github.com/termux/proot-distro), and the packages above come from Debian's own archive.

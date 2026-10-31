@@ -14,9 +14,10 @@ A practical guide to using VSCodroid -- the full VS Code IDE running natively on
 6. [Web Development](#web-development)
 7. [Running and Debugging](#running-and-debugging)
 8. [On-demand Toolchains](#on-demand-toolchains)
-9. [Tips and Tricks](#tips-and-tricks)
-10. [Known Limitations](#known-limitations)
-11. [Troubleshooting](#troubleshooting)
+9. [Desktop Mode (experimental)](#desktop-mode-experimental)
+10. [Tips and Tricks](#tips-and-tricks)
+11. [Known Limitations](#known-limitations)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -1010,6 +1011,55 @@ the sensible ceiling on a phone.
 
 Open the Toolchains screen by either route in [Installing After
 Setup](#installing-after-setup) and remove it there.
+
+---
+
+## Desktop Mode (experimental)
+
+Desktop Mode runs the desktop (Electron) build of VSCodium, the open-source build of VS Code, inside a
+Debian system that lives in this app. You do not need root and you do not install anything else. The
+screen of that desktop is shown in your phone's browser.
+
+It is for people who want the full desktop editor and can accept that it is heavier than the normal
+editor, which stays the default and is not changed by this.
+
+**What you need:** a 64-bit ARM phone, at least 6 GB of RAM (8 GB is better), about 8 GB of free
+storage, and internet for the one-time setup.
+
+**One-time setup** (a few hundred megabytes are downloaded; leave the screen on and the phone on a
+charger):
+
+```
+python3 ~/.vscodroid/desktop.py setup
+```
+
+**Start it:**
+
+```
+python3 ~/.vscodroid/desktop.py start
+```
+
+It prints an address that starts with `http://127.0.0.1:6080`. Open that address in the phone's browser.
+The editor opens your workspace folder. Files you save there are the same files the normal editor
+sees.
+
+**Stop it** when you are done, because it uses a lot of memory and battery:
+
+```
+python3 ~/.vscodroid/desktop.py stop
+```
+
+Other commands: `status` says whether it is running, `shell` opens a shell inside Debian (where
+`apt-get install` works), and `repair` tries other editor settings if the window does not stay up.
+
+**Good to know**
+
+- Extensions come from Open VSX, the registry VSCodium uses. Microsoft's marketplace is not available.
+- The first start takes a minute or more. Typing can lag, because the editor draws without a graphics
+  chip.
+- Touch and the on-screen keyboard work through the browser page; a hardware keyboard works best.
+- The address contains a one-time password. Do not share it.
+- Android may stop background apps. If the desktop disappears, run `start` again.
 
 ---
 
