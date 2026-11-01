@@ -28,6 +28,9 @@ PINNED_SHA256 = os.environ.get("DESKTOP_ROOTFS_SHA256", "")      # fill in after
 WORKSPACE = os.environ.get("DESKTOP_WORKSPACE") or next((p for p in ("/storage/emulated/0/.VScoderoid-Pro", "/storage/emulated/0/VScoderoid-Pro") if os.path.isdir(p)), "/storage/emulated/0/.VScoderoid-Pro")
 GEOMETRY = os.environ.get("DESKTOP_GEOMETRY", "1280x720")
 MIN_RAM_MB = 5500
+# Checksums of root file systems that were tested on a device. A file named here must match; a newer
+# release is accepted only when GitHub publishes its digest (see discover_rootfs).
+KNOWN_SHA256 = {"debian-trixie-aarch64-pd-v4.29.0.tar.xz": "3834a11cbc6496935760bdc20cca7e2c25724d0cd8f5e4926da8fd5ca1857918"}
 
 def emit(row, status, detail=""):
     os.makedirs(BASE, exist_ok=True)
@@ -216,11 +219,15 @@ def cmd_install(args):
         try: used = download(urls, arc)
         except Exception as e: emit("DESK-DOWNLOAD", "FAIL", str(e)[:200]); return
         open(arc + ".strip", "w").write("1" if strip else "0")
+        open(arc + ".name", "w").write(label if not os.environ.get("DESKTOP_ROOTFS_URL") else "")
         emit("DESK-DOWNLOAD", "PASS", f"{os.path.getsize(arc) >> 20} MB from {used}")
     else:
         try: strip = open(arc + ".strip").read() == "1"
         except OSError: pass
     sha = hashlib.sha256(open(arc, "rb").read()).hexdigest()
+    try: known = KNOWN_SHA256.get(open(arc + ".name").read().strip(), "")
+    except OSError: known = ""
+    if not PINNED_SHA256 and (known or sha in KNOWN_SHA256.values()): PINNED_SHA256 = known or sha
     if PINNED_SHA256 and sha != PINNED_SHA256: emit("DESK-CHECKSUM", "FAIL", f"sha256 {sha} does not match the pinned value"); os.remove(arc); return
     emit("DESK-CHECKSUM", "PASS" if PINNED_SHA256 else "WARN", f"sha256={sha}" + ("" if PINNED_SHA256 else " (not pinned yet: put this value in DESKTOP_ROOTFS_SHA256)"))
     if os.path.exists(ROOT) and not os.path.islink(ROOT): shutil.rmtree(ROOT)

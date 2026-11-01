@@ -113,6 +113,11 @@ class LaunchRepairWiringTest {
         // there, so ahead of it a launch that had lost both would repair the
         // directory and leave the link for the launch after.
         "createStorageSymlinks",
+        // Both follow the symlink pair and precede the toolchain repair, in the order
+        // SplashActivity runs them: the shell's baked-in projects path is refreshed
+        // once the directory and link are settled, then the old welcome README goes.
+        "syncProjectsDirExport",
+        "removeLegacyWelcomeReadme",
         "repairInstalledToolchains",
         "reclaimRevokedMirrors",
     )
