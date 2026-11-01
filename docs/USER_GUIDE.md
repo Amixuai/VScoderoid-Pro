@@ -1039,8 +1039,9 @@ python3 ~/.vscodroid/desktop.py setup
 python3 ~/.vscodroid/desktop.py start
 ```
 
-It prints an address that starts with `http://127.0.0.1:6080`. Open that address in the phone's browser.
-The editor opens your workspace folder. Files you save there are the same files the normal editor
+It opens the desktop in your phone's browser by itself. If it does not, it prints an address that starts
+with `http://127.0.0.1:6080`; open that address in the browser (add `--no-open` to stop it from opening
+the browser). The editor opens your workspace folder. Files you save there are the same files the normal editor
 sees.
 
 **Stop it** when you are done, because it uses a lot of memory and battery:
