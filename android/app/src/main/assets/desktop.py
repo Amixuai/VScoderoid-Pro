@@ -428,6 +428,37 @@ def web_ready():
         with urllib.request.urlopen("http://127.0.0.1:6080/vnc.html", timeout=5) as r: return r.status == 200
     except Exception: return False
 
+def ws_probe(timeout=10):
+    """Do what the noVNC page does: open a WebSocket to the viewer's port and read the first frame, which
+    websockify relays from the VNC server. Returns (ok, detail)."""
+    import socket, base64
+    key = base64.b64encode(os.urandom(16)).decode()
+    req = ("GET /websockify HTTP/1.1\r\nHost: 127.0.0.1:6080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: binary\r\n"
+           "Origin: http://127.0.0.1:6080\r\n\r\n").encode()
+    try:
+        with socket.create_connection(("127.0.0.1", 6080), timeout=timeout) as c:
+            c.settimeout(timeout); c.sendall(req); data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = c.recv(4096)
+                if not chunk: break
+                data += chunk
+            head, _, rest = data.partition(b"\r\n\r\n")
+            status = head.split(b"\r\n")[0].decode(errors="replace")
+            if b" 101 " not in (status.encode() + b" "): return False, f"the WebSocket upgrade was refused: {status}"
+            while len(rest) < 2:
+                chunk = c.recv(4096)
+                if not chunk: return False, "the connection closed right after the upgrade (the VNC server was not reached)"
+                rest += chunk
+            n = rest[1] & 0x7F; payload = rest[2:2 + n]
+            while len(payload) < min(n, 12):
+                chunk = c.recv(4096)
+                if not chunk: break
+                payload += chunk
+            return (True, "WebSocket upgrade works and the VNC banner came through: " + payload[:12].decode(errors="replace").strip()) if payload.startswith(b"RFB ") else (False, f"the upgrade worked but the first frame was not a VNC banner: {payload[:20]!r}")
+    except OSError as e:
+        return False, f"could not open the WebSocket: {e}"
+
 def mem_available_mb():
     try:
         for l in open("/proc/meminfo"):
@@ -456,6 +487,8 @@ def show_url(pw):
     v, w = vnc_ready(), web_ready()
     emit("DESK-VNC", "PASS" if v else "FAIL", "the VNC server answers on port 5901" if v else "the VNC server does not answer on port 5901: " + tail(os.path.join(ROOT, "tmp", "xvnc.log"), 4))
     emit("DESK-WEB", "PASS" if w else "FAIL", "the viewer page is served on port 6080" if w else "the viewer page is not served on port 6080: " + tail(os.path.join(ROOT, "tmp", "websockify.log"), 4))
+    ok, why = ws_probe()
+    emit("DESK-WS", "PASS" if ok else "FAIL", why if ok else why + " | " + tail(os.path.join(ROOT, "tmp", "websockify.log"), 5))
     url = f"http://127.0.0.1:6080/vnc.html?autoconnect=1&reconnect=true&reconnect_delay=2000&resize={RESIZE}&password={pw}"
     emit("DESK-URL", "PASS", url)
     opened = "--no-open" not in sys.argv and open_in_browser(url)
