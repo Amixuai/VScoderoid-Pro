@@ -10,9 +10,6 @@ Run it from the terminal of this app:
     python3 ~/.vscodroid/desktop.py shell     open a shell inside Debian
     python3 ~/.vscodroid/desktop.py repair    try other Electron flag sets if the editor window does not stay up
 
-Options for start: --geometry=WxH (screen size, default 1280x720, for example --geometry=1080x1920 for a tall
-phone), --remote (resize the desktop to the window instead of shrinking it), --no-open.
-
 It needs a 64-bit ARM phone with at least 6 GB of RAM and about 8 GB of free storage. Everything it creates lives in
 $HOME/desktop, and a log of each step is kept in $HOME/desktop/desktop-log.txt.
 """
@@ -30,7 +27,6 @@ URLS = [os.environ["DESKTOP_ROOTFS_URL"]] if os.environ.get("DESKTOP_ROOTFS_URL"
 PINNED_SHA256 = os.environ.get("DESKTOP_ROOTFS_SHA256", "")      # fill in after the first run prints it
 WORKSPACE = os.environ.get("DESKTOP_WORKSPACE") or next((p for p in ("/storage/emulated/0/.VScoderoid-Pro", "/storage/emulated/0/VScoderoid-Pro") if os.path.isdir(p)), "/storage/emulated/0/.VScoderoid-Pro")
 GEOMETRY = os.environ.get("DESKTOP_GEOMETRY", "1280x720")
-RESIZE = "scale"      # how the viewer fits the screen: "scale" shrinks it to the window, "remote" resizes the desktop to the window
 MIN_RAM_MB = 5500
 # Checksums of root file systems that were tested on a device. A file named here must match; a newer
 # release is accepted only when GitHub publishes its digest (see discover_rootfs).
@@ -408,41 +404,13 @@ def watch(p, seconds=80):
         if time.time() - t0 > 12: big = next((w for w in window_sizes() if w[0] >= 400 and w[1] >= 300), big)
     return big, crashed
 
-def open_in_browser(url):
-    """Hand the address to the phone's browser through the app's own xdg-open, when it is there."""
-    opener = shutil.which("xdg-open")
-    if not opener: return False
-    try: return subprocess.run([opener, url], capture_output=True, timeout=20).returncode == 0
-    except Exception: return False
-
-def open_in_browser(url):
-    """Hand the address to the phone's browser through the app's own xdg-open, when it is there."""
-    opener = shutil.which("xdg-open")
-    if not opener: return False
-    try: return subprocess.run([opener, url], capture_output=True, timeout=20).returncode == 0
-    except Exception: return False
-
 def show_url(pw):
-    url = f"http://127.0.0.1:6080/vnc.html?autoconnect=1&resize={RESIZE}&password={pw}"
+    url = f"http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale&password={pw}"
     emit("DESK-URL", "PASS", url)
-    opened = "--no-open" not in sys.argv and open_in_browser(url)
-    print("\nThe desktop is running." + (" It was opened in your browser." if opened else " Open this address in the phone's browser:"), flush=True)
-    print(f"  {url}\n(stop it later with: python3 ~/.vscodroid/desktop.py stop)\n", flush=True)
-
-def apply_options(args):
-    """Options for one run of start/repair: --geometry=WxH, --remote, --scale. Anything else is ignored."""
-    global GEOMETRY, RESIZE
-    for a in args:
-        if a.startswith("--geometry="):
-            g = a.split("=", 1)[1]
-            if re.fullmatch(r"\d{3,4}x\d{3,4}", g): GEOMETRY = g
-            else: print("ignored --geometry: use WIDTHxHEIGHT, for example --geometry=1080x1920", flush=True)
-        elif a == "--remote": RESIZE = "remote"
-        elif a == "--scale": RESIZE = "scale"
+    print(f"\nOpen this in the phone browser:\n  {url}\n(stop later with: python3 desktop_poc.py stop)\n", flush=True)
 
 def cmd_go(args):
     """One command: try the flag sets with a strict check, keep the first stable one, leave the desktop running."""
-    apply_options(args)
     need_root(); pw = secrets.token_hex(4); open(OUTF, "a").close()
     for name, flags, user in VARIANTS:
         if os.path.exists(PIDF): cmd_stop([])
@@ -460,7 +428,6 @@ def cmd_go(args):
     cmd_stop([]); emit("DESK-TRIAL-DONE", "FAIL", "no flag set gave a stable editor window; send this output")
 
 def cmd_start(args):
-    apply_options(args)
     need_root()
     if os.path.exists(PIDF): cmd_stop([])
     flags, user = load_config(); pw = secrets.token_hex(4); open(OUTF, "a").close()
