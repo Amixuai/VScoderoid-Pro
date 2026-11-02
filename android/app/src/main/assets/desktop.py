@@ -308,7 +308,9 @@ def current_flags():
 START_SH = """#!/bin/sh
 export DISPLAY=:1 ELECTRON_ENABLE_LOGGING=1
 mkdir -p "$HOME/.vnc" "$HOME/workspace"
-[ -f "$HOME/.vnc/passwd" ] || echo "$VNC_PW" | vncpasswd -f > "$HOME/.vnc/passwd"
+# Written on every start: the address printed for this session carries this session's password, so a file
+# kept from an earlier start would reject it ("Failed to connect to server" in the viewer).
+echo "$VNC_PW" | vncpasswd -f > "$HOME/.vnc/passwd"
 chmod 600 "$HOME/.vnc/passwd"
 rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 /tmp/codium.log
 Xtigervnc :1 -rfbauth "$HOME/.vnc/passwd" -localhost yes -geometry %(geo)s -depth 24 -rfbport 5901 -SecurityTypes VncAuth >/tmp/xvnc.log 2>&1 &
@@ -408,12 +410,40 @@ def watch(p, seconds=80):
         if time.time() - t0 > 12: big = next((w for w in window_sizes() if w[0] >= 400 and w[1] >= 300), big)
     return big, crashed
 
-def open_in_browser(url):
-    """Hand the address to the phone's browser through the app's own xdg-open, when it is there."""
-    opener = shutil.which("xdg-open")
-    if not opener: return False
-    try: return subprocess.run([opener, url], capture_output=True, timeout=20).returncode == 0
+def vnc_ready(timeout=20):
+    """True when the VNC server answers with its RFB banner on the local port."""
+    import socket
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with socket.create_connection(("127.0.0.1", 5901), timeout=3) as c:
+                if c.recv(12).startswith(b"RFB "): return True
+        except OSError: pass
+        time.sleep(2)
+    return False
+
+def web_ready():
+    """True when the noVNC page itself is served on the local port."""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:6080/vnc.html", timeout=5) as r: return r.status == 200
     except Exception: return False
+
+def mem_available_mb():
+    try:
+        for l in open("/proc/meminfo"):
+            if l.startswith("MemAvailable:"): return int(l.split()[1]) // 1024
+    except OSError: pass
+    return 0
+
+def rss_mb(word="codium"):
+    pages = 0
+    for d in os.listdir("/proc"):
+        if not d.isdigit(): continue
+        try:
+            cl = open(f"/proc/{d}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+            if word in cl and "desktop" not in cl and "--kill-on-exit" not in cl: pages += int(open(f"/proc/{d}/statm").read().split()[1])
+        except OSError: continue
+    return pages * 4096 // (1 << 20)
 
 def open_in_browser(url):
     """Hand the address to the phone's browser through the app's own xdg-open, when it is there."""
@@ -423,7 +453,10 @@ def open_in_browser(url):
     except Exception: return False
 
 def show_url(pw):
-    url = f"http://127.0.0.1:6080/vnc.html?autoconnect=1&resize={RESIZE}&password={pw}"
+    v, w = vnc_ready(), web_ready()
+    emit("DESK-VNC", "PASS" if v else "FAIL", "the VNC server answers on port 5901" if v else "the VNC server does not answer on port 5901: " + tail(os.path.join(ROOT, "tmp", "xvnc.log"), 4))
+    emit("DESK-WEB", "PASS" if w else "FAIL", "the viewer page is served on port 6080" if w else "the viewer page is not served on port 6080: " + tail(os.path.join(ROOT, "tmp", "websockify.log"), 4))
+    url = f"http://127.0.0.1:6080/vnc.html?autoconnect=1&reconnect=true&reconnect_delay=2000&resize={RESIZE}&password={pw}"
     emit("DESK-URL", "PASS", url)
     opened = "--no-open" not in sys.argv and open_in_browser(url)
     print("\nThe desktop is running." + (" It was opened in your browser." if opened else " Open this address in the phone's browser:"), flush=True)
@@ -459,8 +492,16 @@ def cmd_go(args):
             json.dump({"flags": flags, "user": user}, open(CONFIG_FILE, "w")); show_url(pw); return
     cmd_stop([]); emit("DESK-TRIAL-DONE", "FAIL", "no flag set gave a stable editor window; send this output")
 
+def check_memory(args):
+    free = mem_available_mb()
+    if free and free < 1000 and "--force" not in args:
+        emit("DESK-MEMORY", "FAIL", f"only {free} MB of memory is free; close other apps first (or add --force to try anyway)"); return False
+    if free and free < 1800: emit("DESK-MEMORY", "WARN", f"{free} MB of memory is free; the desktop needs about 2 GB, so close other apps if it is slow")
+    return True
+
 def cmd_start(args):
     apply_options(args)
+    if not check_memory(args): return
     need_root()
     if os.path.exists(PIDF): cmd_stop([])
     flags, user = load_config(); pw = secrets.token_hex(4); open(OUTF, "a").close()
@@ -481,7 +522,7 @@ def cmd_stop(args):
     os.remove(PIDF); emit("DESK-STOP", "PASS", "session stopped")
 
 def cmd_status(args):
-    try: d = json.load(open(PIDF)); os.kill(d["pid"], 0); print("running, pid", d["pid"])
+    try: d = json.load(open(PIDF)); os.kill(d["pid"], 0); print(f"running, pid {d['pid']}, the editor uses about {rss_mb()} MB of memory, {mem_available_mb()} MB is free")
     except Exception: print("not running")
 
 if __name__ == "__main__":

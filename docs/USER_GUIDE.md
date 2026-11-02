@@ -1065,7 +1065,16 @@ Other commands: `status` says whether it is running, `shell` opens a shell insid
   chip.
 - Touch and the on-screen keyboard work through the browser page; a hardware keyboard works best.
 - The address contains a one-time password. Do not share it.
-- Android may stop background apps. If the desktop disappears, run `start` again.
+- Android may stop background apps. If the desktop disappears, run `start` again. On Android 12 and newer
+  it can also end the many small processes the desktop uses. On Android 14 and newer, turn on Developer
+  options and switch off "Disable child process restrictions"; on Android 12 and 13 this needs an `adb`
+  setting.
+- `status` shows whether it runs and how much memory the editor uses. `start` refuses to begin when under
+  1 GB of memory is free (add `--force` to try anyway) and warns when under 1.8 GB is free.
+- If the viewer shows "Failed to connect to server", run `stop` and then `start` again, and use the new
+  address. Each start has its own password.
+- Do not press the full-screen button inside the viewer: its screen is already full size, and the button
+  only shows an error.
 
 ---
 
