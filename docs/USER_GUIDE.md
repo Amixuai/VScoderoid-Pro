@@ -1046,6 +1046,9 @@ an address that starts with `http://127.0.0.1:6080`; open that address in the ph
 `--no-open` to stop it from trying). The editor opens your workspace folder. Files you save there are the same files the normal editor
 sees.
 
+If the text looks too small, give the desktop a screen shaped like your phone, for example
+`python3 ~/.vscodroid/desktop.py start --geometry=1080x1920`, or let it follow the window with `--remote`.
+
 **Stop it** when you are done, because it uses a lot of memory and battery:
 
 ```
