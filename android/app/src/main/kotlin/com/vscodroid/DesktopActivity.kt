@@ -86,7 +86,7 @@ class DesktopActivity : AppCompatActivity() {
                 }
 
                 override fun onRenderProcessGone(v: WebView, detail: RenderProcessGoneDetail): Boolean {
-                    Logger.w(tag, "The viewer's render process ended; closing the screen")
+                    Logger.w(this@DesktopActivity.tag, "The viewer's render process ended; closing the screen")
                     finish()
                     return true
                 }
