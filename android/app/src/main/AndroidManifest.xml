@@ -192,6 +192,16 @@
             android:parentActivityName=".MainActivity"
             android:theme="@style/Theme.VSCodroid" />
 
+        <!-- Desktop Mode: shows the desktop VSCodium that runs in the Debian system, inside the app.
+             Not exported and with no filter: the bridge starts it by name for the one address
+             desktop.py prints, and the activity refuses any other. -->
+        <activity
+            android:name=".DesktopActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.VSCodroid" />
+
         <!-- Node.js server service: runs the Code - OSS server locally -->
         <service
             android:name=".service.NodeService"

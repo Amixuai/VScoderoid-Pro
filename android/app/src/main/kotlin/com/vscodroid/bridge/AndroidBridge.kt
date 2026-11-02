@@ -12,6 +12,8 @@ import android.webkit.JavascriptInterface
 import androidx.annotation.StringRes
 import androidx.browser.customtabs.CustomTabsIntent
 import com.google.android.play.core.assetpacks.model.AssetPackStatus
+import com.vscodroid.DesktopActivity
+import com.vscodroid.DesktopAddress
 import com.vscodroid.R
 import com.vscodroid.authCallbackIsExpected
 import com.vscodroid.isExtensionCallback
@@ -733,9 +735,15 @@ class AndroidBridge(
                 customTabsIntent.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 customTabsIntent.launchUrl(context, uri)
             } else {
-                val intent = Intent(Intent.ACTION_VIEW, uri).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                // The one local page that opens inside the app: the desktop viewer
+                // `desktop.py start` prints. Same single launch as before, with the
+                // activity named instead of the system browser being asked.
+                val intent = if (DesktopAddress.matches(uri)) {
+                    Intent(context, DesktopActivity::class.java).setData(uri)
+                } else {
+                    Intent(Intent.ACTION_VIEW, uri)
                 }
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 context.startActivity(intent)
             }
             AuthTabWindow.launched(armed)
