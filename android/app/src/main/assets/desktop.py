@@ -404,10 +404,26 @@ def watch(p, seconds=80):
         if time.time() - t0 > 12: big = next((w for w in window_sizes() if w[0] >= 400 and w[1] >= 300), big)
     return big, crashed
 
+def open_in_browser(url):
+    """Hand the address to the phone's browser through the app's own xdg-open, when it is there."""
+    opener = shutil.which("xdg-open")
+    if not opener: return False
+    try: return subprocess.run([opener, url], capture_output=True, timeout=20).returncode == 0
+    except Exception: return False
+
+def open_in_browser(url):
+    """Hand the address to the phone's browser through the app's own xdg-open, when it is there."""
+    opener = shutil.which("xdg-open")
+    if not opener: return False
+    try: return subprocess.run([opener, url], capture_output=True, timeout=20).returncode == 0
+    except Exception: return False
+
 def show_url(pw):
     url = f"http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale&password={pw}"
     emit("DESK-URL", "PASS", url)
-    print(f"\nOpen this in the phone browser:\n  {url}\n(stop later with: python3 desktop_poc.py stop)\n", flush=True)
+    opened = "--no-open" not in sys.argv and open_in_browser(url)
+    print("\nThe desktop is running." + (" It was opened in your browser." if opened else " Open this address in the phone's browser:"), flush=True)
+    print(f"  {url}\n(stop it later with: python3 ~/.vscodroid/desktop.py stop)\n", flush=True)
 
 def cmd_go(args):
     """One command: try the flag sets with a strict check, keep the first stable one, leave the desktop running."""

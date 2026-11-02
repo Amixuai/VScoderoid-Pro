@@ -1039,15 +1039,10 @@ python3 ~/.vscodroid/desktop.py setup
 python3 ~/.vscodroid/desktop.py start
 ```
 
-It opens the desktop in a screen inside the app by itself, when you run it from the editor's terminal.
-The back button closes that screen and leaves the desktop running; run `start` again to come back to it.
-If the screen does not open, for instance when you run the command from another terminal, `start` prints
-an address that starts with `http://127.0.0.1:6080`; open that address in the phone's browser (add
-`--no-open` to stop it from trying). The editor opens your workspace folder. Files you save there are the same files the normal editor
+It opens the desktop in your phone's browser by itself. If it does not, it prints an address that starts
+with `http://127.0.0.1:6080`; open that address in the browser (add `--no-open` to stop it from opening
+the browser). The editor opens your workspace folder. Files you save there are the same files the normal editor
 sees.
-
-If the text looks too small, give the desktop a screen shaped like your phone, for example
-`python3 ~/.vscodroid/desktop.py start --geometry=1080x1920`, or let it follow the window with `--remote`.
 
 **Stop it** when you are done, because it uses a lot of memory and battery:
 
