@@ -1,16 +1,22 @@
 package com.vscodroid
 
 import android.annotation.SuppressLint
+import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.webkit.ConsoleMessage
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import com.vscodroid.util.Logger
@@ -56,7 +62,7 @@ class DesktopActivity : AppCompatActivity() {
     private val tag = "DesktopActivity"
     private var webView: WebView? = null
 
-    @SuppressLint("SetJavaScriptEnabled")
+    @SuppressLint("SetJavaScriptEnabled", "SetTextI18n")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val address = intent?.data
@@ -68,6 +74,19 @@ class DesktopActivity : AppCompatActivity() {
         drawBehindSystemBars()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        // What the viewer page reports when it cannot connect. noVNC says only "Failed to connect
+        // to server"; the browser's own message (a refused handshake, a blocked request) says why.
+        // Shown at the bottom, selectable so it can be copied, dismissed by a tap. The session
+        // password is cut out of anything shown.
+        val note = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setBackgroundColor(0xDD000000.toInt())
+            textSize = 12f
+            setPadding(24, 16, 24, 16)
+            setTextIsSelectable(true)
+            visibility = View.GONE
+            setOnClickListener { visibility = View.GONE }
+        }
         val view = WebView(this).apply {
             settings.apply {
                 javaScriptEnabled = true
@@ -77,6 +96,19 @@ class DesktopActivity : AppCompatActivity() {
                 setSupportMultipleWindows(false)
                 mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                 cacheMode = WebSettings.LOAD_NO_CACHE
+            }
+            webChromeClient = object : WebChromeClient() {
+                override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+                    val level = message.messageLevel()
+                    if (level == ConsoleMessage.MessageLevel.ERROR || level == ConsoleMessage.MessageLevel.WARNING) {
+                        val shown = message.message().replace(Regex("password=[^&\\s'\"]*"), "password=...")
+                        note.post {
+                            note.text = appendNote(note.text.toString(), shown)
+                            note.visibility = View.VISIBLE
+                        }
+                    }
+                    return true
+                }
             }
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
@@ -96,6 +128,7 @@ class DesktopActivity : AppCompatActivity() {
 
         val root = FrameLayout(this).apply {
             addView(view, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(note, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
             padForSystemBars()
         }
         setContentView(root)
@@ -109,6 +142,10 @@ class DesktopActivity : AppCompatActivity() {
         if (savedInstanceState == null) view.loadUrl(address.toString())
         view.requestFocus()
     }
+
+    /** The viewer's messages, newest last, kept short enough to fit above the keyboard. */
+    private fun appendNote(shownSoFar: String, added: String): String =
+        (shownSoFar + System.lineSeparator() + added).trim().takeLast(700)
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)

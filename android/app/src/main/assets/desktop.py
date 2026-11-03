@@ -30,6 +30,7 @@ URLS = [os.environ["DESKTOP_ROOTFS_URL"]] if os.environ.get("DESKTOP_ROOTFS_URL"
 PINNED_SHA256 = os.environ.get("DESKTOP_ROOTFS_SHA256", "")      # fill in after the first run prints it
 WORKSPACE = os.environ.get("DESKTOP_WORKSPACE") or next((p for p in ("/storage/emulated/0/.VScoderoid-Pro", "/storage/emulated/0/VScoderoid-Pro") if os.path.isdir(p)), "/storage/emulated/0/.VScoderoid-Pro")
 GEOMETRY = os.environ.get("DESKTOP_GEOMETRY", "1280x720")
+USE_BROWSER = False   # --browser: open the address in the phone's browser instead of the screen inside the app
 RESIZE = "scale"      # how the viewer fits the screen: "scale" shrinks it to the window, "remote" resizes the desktop to the window
 MIN_RAM_MB = 5500
 # Checksums of root file systems that were tested on a device. A file named here must match; a newer
@@ -48,6 +49,26 @@ def ram_mb():
             if l.startswith("MemTotal:"): return int(l.split()[1]) // 1024
     except OSError: pass
     return 0
+
+SESSION_WORDS = ("Xtigervnc", "websockify", "openbox", "start-desktop.sh", "/usr/share/codium/", "--kill-on-exit")
+
+def kill_session_processes():
+    """End every process of a desktop session, not only the group the session started in. A server left
+    over from an earlier start keeps port 5901 and the old password, so the next start would show a
+    viewer that cannot log in. Returns how many it found."""
+    found = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) == os.getpid(): continue
+        try: cl = open(f"/proc/{d}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError: continue
+        if "desktop.py" in cl or "desktop_poc" in cl: continue
+        if any(w in cl for w in SESSION_WORDS): found.append(int(d))
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in found:
+            try: os.kill(pid, sig)
+            except OSError: pass
+        if sig == signal.SIGTERM: time.sleep(1.5)
+    return len(found)
 
 def host_env():
     """proot itself must not run under the app's exec interceptor: termux-exec rewrites every exec path
@@ -353,6 +374,8 @@ def write_start_script(flags):
     return "/usr/local/bin/start-desktop.sh"
 
 def spawn(pw, flags, user, host_extra=None):
+    left = kill_session_processes()
+    if left: emit("DESK-CLEAN", "WARN", f"{left} processes of an earlier session were still running and were ended")
     ensure_user(); script = write_start_script(flags)
     home = "/home/user" if user else "/root"
     binds = [f"{WORKSPACE}:{home}/workspace"] if os.path.isdir(WORKSPACE) else []
@@ -489,7 +512,8 @@ def show_url(pw):
     emit("DESK-WEB", "PASS" if w else "FAIL", "the viewer page is served on port 6080" if w else "the viewer page is not served on port 6080: " + tail(os.path.join(ROOT, "tmp", "websockify.log"), 4))
     ok, why = ws_probe()
     emit("DESK-WS", "PASS" if ok else "FAIL", why if ok else why + " | " + tail(os.path.join(ROOT, "tmp", "websockify.log"), 5))
-    url = f"http://127.0.0.1:6080/vnc.html?autoconnect=1&reconnect=true&reconnect_delay=2000&resize={RESIZE}&password={pw}"
+    # "localhost" is not the address the in-app screen takes, so --browser reaches the browser.
+    url = f"http://{'localhost' if USE_BROWSER else '127.0.0.1'}:6080/vnc.html?autoconnect=1&reconnect=true&reconnect_delay=2000&resize={RESIZE}&password={pw}"
     emit("DESK-URL", "PASS", url)
     opened = "--no-open" not in sys.argv and open_in_browser(url)
     print("\nThe desktop is running." + (" It was opened in your browser." if opened else " Open this address in the phone's browser:"), flush=True)
@@ -497,12 +521,13 @@ def show_url(pw):
 
 def apply_options(args):
     """Options for one run of start/repair: --geometry=WxH, --remote, --scale. Anything else is ignored."""
-    global GEOMETRY, RESIZE
+    global GEOMETRY, RESIZE, USE_BROWSER
     for a in args:
         if a.startswith("--geometry="):
             g = a.split("=", 1)[1]
             if re.fullmatch(r"\d{3,4}x\d{3,4}", g): GEOMETRY = g
             else: print("ignored --geometry: use WIDTHxHEIGHT, for example --geometry=1080x1920", flush=True)
+        elif a == "--browser": USE_BROWSER = True
         elif a == "--remote": RESIZE = "remote"
         elif a == "--scale": RESIZE = "scale"
 
@@ -552,7 +577,8 @@ def cmd_stop(args):
     time.sleep(1)
     try: os.killpg(d["pid"], signal.SIGKILL)
     except Exception: pass
-    os.remove(PIDF); emit("DESK-STOP", "PASS", "session stopped")
+    left = kill_session_processes()
+    os.remove(PIDF); emit("DESK-STOP", "PASS", "session stopped" + (f" ({left} leftover processes ended)" if left else ""))
 
 def cmd_status(args):
     try: d = json.load(open(PIDF)); os.kill(d["pid"], 0); print(f"running, pid {d['pid']}, the editor uses about {rss_mb()} MB of memory, {mem_available_mb()} MB is free")

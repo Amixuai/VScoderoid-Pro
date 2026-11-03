@@ -134,6 +134,31 @@ android {
         }
     }
 
+    // One key for every build that someone installs over the one before it.
+    //
+    // Android refuses to update an app whose new APK is signed with a different
+    // certificate, and says only "App not installed". A debug build is signed
+    // with a key Gradle generates on the machine that builds it, and every CI
+    // run is a new machine, so each build had a certificate of its own and the
+    // only way to install the next one was to uninstall first, which deletes
+    // the app's whole home directory: projects, packages, toolchains, the
+    // Debian system of Desktop Mode.
+    //
+    // So when the release key is supplied, the debug build is signed with it
+    // too (the same VSCODROID_KEYSTORE_* variables the release job reads, set
+    // from the same repository secrets). When it is not, as on a pull request
+    // from a fork, where secrets are withheld, the build falls back to Gradle's
+    // own debug key and installs as before. The release signing above is
+    // unchanged.
+    val sharedKeyFile = signingProp("storeFile", "VSCODROID_KEYSTORE_FILE")
+    val sharedKeyUsable = sharedKeyFile.isNotBlank() && file(sharedKeyFile).isFile &&
+        signingProp("storePassword", "VSCODROID_KEYSTORE_PASSWORD").isNotBlank() &&
+        signingProp("keyAlias", "VSCODROID_KEY_ALIAS", "vscodroid").isNotBlank() &&
+        signingProp("keyPassword", "VSCODROID_KEY_PASSWORD").isNotBlank()
+    if (!sharedKeyUsable) {
+        logger.warn("No shared signing key supplied: the debug APK is signed with a throwaway key and cannot update an install made from another build.")
+    }
+
     defaultConfig {
         applicationId = "com.vscodroid"
         minSdk = 30
@@ -285,6 +310,7 @@ android {
         }
         debug {
             isMinifyEnabled = false
+            if (sharedKeyUsable) signingConfig = signingConfigs.getByName("release")
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
             // Which of the 2000-odd unit tests actually reach a line, answered by
@@ -473,6 +499,20 @@ android {
         compilerOptions {
             jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
         }
+    }
+}
+
+// A debug build has to carry a higher versionCode than the one it replaces, or
+// Android calls the install a downgrade and refuses it; and this app unpacks its
+// bundled files only when the versionCode changes, so a rebuilt APK with the
+// same number would update without its new files. CI passes its run number,
+// which only rises. This touches the debug variant alone: the release gates
+// read the literal versionCode in defaultConfig, which stays as it is.
+androidComponents {
+    onVariants(selector().withBuildType("debug")) { variant ->
+        providers.environmentVariable("VSCODROID_DEBUG_VERSION_CODE").orNull
+            ?.toIntOrNull()
+            ?.let { run -> variant.outputs.forEach { it.versionCode.set(1000 + run) } }
     }
 }
 

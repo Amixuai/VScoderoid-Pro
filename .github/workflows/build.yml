@@ -391,8 +391,35 @@ jobs:
       - name: Check the welcome screen states nothing that goes stale
         run: python3 scripts/check-welcome-claims.py
 
+      # Every build is signed with the one key kept in the repository secrets, so
+      # a new APK installs over the previous one instead of failing with "App not
+      # installed". Pull requests from forks get no secrets: the step says so and
+      # the build falls back to Gradle's throwaway debug key.
+      - name: Prepare the signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::KEYSTORE_BASE64 is not available (a fork pull request, or the secret is not set)." \
+                 "This APK is signed with a throwaway key and cannot update an app installed from another build."
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore.jks"
+          if [ ! -s "$RUNNER_TEMP/keystore.jks" ]; then
+            echo "::error::KEYSTORE_BASE64 decoded to nothing."
+            exit 1
+          fi
+          echo "VSCODROID_KEYSTORE_FILE=$RUNNER_TEMP/keystore.jks" >> "$GITHUB_ENV"
+
+      # The version code rises with every run (Gradle adds it to 1000), so Android
+      # sees each build as an upgrade of the one before it.
       - name: Build debug APK
         working-directory: android
+        env:
+          VSCODROID_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          VSCODROID_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          VSCODROID_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          VSCODROID_DEBUG_VERSION_CODE: ${{ github.run_number }}
         run: ./gradlew assembleDebug
 
       - name: Upload debug APK
