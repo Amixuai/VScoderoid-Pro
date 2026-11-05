@@ -50,7 +50,7 @@ def ram_mb():
     except OSError: pass
     return 0
 
-SESSION_WORDS = ("Xtigervnc", "websockify", "openbox", "start-desktop.sh", "/usr/share/codium/", "--kill-on-exit")
+SESSION_WORDS = ("Xtigervnc", "websockify", "openbox", "start-desktop.sh", "/usr/share/codium/")
 
 def kill_session_processes():
     """End every process of a desktop session, not only the group the session started in. A server left
@@ -148,7 +148,7 @@ def discover_rootfs():
 
 def need_root():
     if not os.path.isdir(os.path.join(ROOT, "usr/bin")):
-        emit("DESK-ROOTFS", "FAIL", "no Debian system yet: run  python3 desktop_poc.py install  first")
+        emit("DESK-ROOTFS", "FAIL", "no Debian system yet: run  python3 ~/.vscodroid/desktop.py setup  first (and wait for it to finish)")
         raise SystemExit(1)
 
 def download(urls, dest):
@@ -482,6 +482,113 @@ def ws_probe(timeout=10):
     except OSError as e:
         return False, f"could not open the WebSocket: {e}"
 
+# --- A real VNC login, over the same WebSocket the viewer page uses -------------------------------------
+_IP = [58,50,42,34,26,18,10,2,60,52,44,36,28,20,12,4,62,54,46,38,30,22,14,6,64,56,48,40,32,24,16,8,57,49,41,33,25,17,9,1,59,51,43,35,27,19,11,3,61,53,45,37,29,21,13,5,63,55,47,39,31,23,15,7]
+_FP = [40,8,48,16,56,24,64,32,39,7,47,15,55,23,63,31,38,6,46,14,54,22,62,30,37,5,45,13,53,21,61,29,36,4,44,12,52,20,60,28,35,3,43,11,51,19,59,27,34,2,42,10,50,18,58,26,33,1,41,9,49,17,57,25]
+_E = [32,1,2,3,4,5,4,5,6,7,8,9,8,9,10,11,12,13,12,13,14,15,16,17,16,17,18,19,20,21,20,21,22,23,24,25,24,25,26,27,28,29,28,29,30,31,32,1]
+_P = [16,7,20,21,29,12,28,17,1,15,23,26,5,18,31,10,2,8,24,14,32,27,3,9,19,13,30,6,22,11,4,25]
+_PC1 = [57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,60,52,44,36,63,55,47,39,31,23,15,7,62,54,46,38,30,22,14,6,61,53,45,37,29,21,13,5,28,20,12,4]
+_PC2 = [14,17,11,24,1,5,3,28,15,6,21,10,23,19,12,4,26,8,16,7,27,20,13,2,41,52,31,37,47,55,30,40,51,45,33,48,44,49,39,56,34,53,46,42,50,36,29,32]
+_SH = [1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1]
+_S = [
+ [14,4,13,1,2,15,11,8,3,10,6,12,5,9,0,7,0,15,7,4,14,2,13,1,10,6,12,11,9,5,3,8,4,1,14,8,13,6,2,11,15,12,9,7,3,10,5,0,15,12,8,2,4,9,1,7,5,11,3,14,10,0,6,13],
+ [15,1,8,14,6,11,3,4,9,7,2,13,12,0,5,10,3,13,4,7,15,2,8,14,12,0,1,10,6,9,11,5,0,14,7,11,10,4,13,1,5,8,12,6,9,3,2,15,13,8,10,1,3,15,4,2,11,6,7,12,0,5,14,9],
+ [10,0,9,14,6,3,15,5,1,13,12,7,11,4,2,8,13,7,0,9,3,4,6,10,2,8,5,14,12,11,15,1,13,6,4,9,8,15,3,0,11,1,2,12,5,10,14,7,1,10,13,0,6,9,8,7,4,15,14,3,11,5,2,12],
+ [7,13,14,3,0,6,9,10,1,2,8,5,11,12,4,15,13,8,11,5,6,15,0,3,4,7,2,12,1,10,14,9,10,6,9,0,12,11,7,13,15,1,3,14,5,2,8,4,3,15,0,6,10,1,13,8,9,4,5,11,12,7,2,14],
+ [2,12,4,1,7,10,11,6,8,5,3,15,13,0,14,9,14,11,2,12,4,7,13,1,5,0,15,10,3,9,8,6,4,2,1,11,10,13,7,8,15,9,12,5,6,3,0,14,11,8,12,7,1,14,2,13,6,15,0,9,10,4,5,3],
+ [12,1,10,15,9,2,6,8,0,13,3,4,14,7,5,11,10,15,4,2,7,12,9,5,6,1,13,14,0,11,3,8,9,14,15,5,2,8,12,3,7,0,4,10,1,13,11,6,4,3,2,12,9,5,15,10,11,14,1,7,6,0,8,13],
+ [4,11,2,14,15,0,8,13,3,12,9,7,5,10,6,1,13,0,11,7,4,9,1,10,14,3,5,12,2,15,8,6,1,4,11,13,12,3,7,14,10,15,6,8,0,5,9,2,6,11,13,8,1,4,10,7,9,5,0,15,14,2,3,12],
+ [13,2,8,4,6,15,11,1,10,9,3,14,5,0,12,7,1,15,13,8,10,3,7,4,12,5,6,11,0,14,9,2,7,11,4,1,9,12,14,2,0,6,10,13,15,3,5,8,2,1,14,7,4,10,8,13,15,12,9,0,3,5,6,11]]
+
+def _bits(b): return [(byte >> (7 - i)) & 1 for byte in b for i in range(8)]
+def _bytes(bits): return bytes(sum(bits[i + j] << (7 - j) for j in range(8)) for i in range(0, len(bits), 8))
+
+def des_encrypt_block(key8, block8):
+    """Plain DES on one 8-byte block (needed for VNC password login; the standard library has no DES)."""
+    k = _bits(key8); k = [k[i - 1] for i in _PC1]; c, d = k[:28], k[28:]; subkeys = []
+    for sh in _SH:
+        c, d = c[sh:] + c[:sh], d[sh:] + d[:sh]; cd = c + d; subkeys.append([cd[i - 1] for i in _PC2])
+    m = _bits(block8); m = [m[i - 1] for i in _IP]; l, r = m[:32], m[32:]
+    for sk in subkeys:
+        er = [r[i - 1] for i in _E]; x = [a ^ b for a, b in zip(er, sk)]; out = []
+        for n in range(8):
+            blk = x[n * 6:n * 6 + 6]; row = (blk[0] << 1) | blk[5]; col = (blk[1] << 3) | (blk[2] << 2) | (blk[3] << 1) | blk[4]
+            v = _S[n][row * 16 + col]; out += [(v >> 3) & 1, (v >> 2) & 1, (v >> 1) & 1, v & 1]
+        f = [out[i - 1] for i in _P]; l, r = r, [a ^ b for a, b in zip(l, f)]
+    pre = r + l
+    return _bytes([pre[i - 1] for i in _FP])
+
+def vnc_response(password, challenge):
+    """The 16-byte answer to a VNC password challenge: DES with the password's bytes bit-reversed as the key."""
+    key = bytes(int(f"{b:08b}"[::-1], 2) for b in (password.encode()[:8].ljust(8, b"\0")))
+    return des_encrypt_block(key, challenge[:8]) + des_encrypt_block(key, challenge[8:16])
+
+class _WS:
+    def __init__(self, sock, leftover): self.s = sock; self.raw = leftover; self.buf = b""
+    def _raw(self, n):
+        while len(self.raw) < n:
+            chunk = self.s.recv(4096)
+            if not chunk: raise EOFError("the connection closed")
+            self.raw += chunk
+        out, self.raw = self.raw[:n], self.raw[n:]; return out
+    def read(self, n):
+        import struct
+        while len(self.buf) < n:
+            h = self._raw(2); op = h[0] & 0x0F; ln = h[1] & 0x7F
+            if ln == 126: ln = struct.unpack(">H", self._raw(2))[0]
+            elif ln == 127: ln = struct.unpack(">Q", self._raw(8))[0]
+            data = self._raw(ln)
+            if op == 8: raise EOFError("the server closed the WebSocket")
+            if op in (0, 1, 2): self.buf += data
+        out, self.buf = self.buf[:n], self.buf[n:]; return out
+    def send(self, data):
+        import struct
+        mask = os.urandom(4); n = len(data)
+        hdr = bytes([0x82]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n)) + mask
+        self.s.sendall(hdr + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+def vnc_login(password, timeout=20):
+    """Log in the way the viewer page does, over a WebSocket, and wait for the first screen update.
+    Returns (ok, detail); detail names the step that failed."""
+    import socket, base64, struct
+    key = base64.b64encode(os.urandom(16)).decode()
+    req = ("GET /websockify HTTP/1.1\r\nHost: 127.0.0.1:6080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: binary\r\n"
+           "Origin: http://127.0.0.1:6080\r\n\r\n").encode()
+    step = "connecting"
+    try:
+        with socket.create_connection(("127.0.0.1", 6080), timeout=timeout) as c:
+            c.settimeout(timeout); c.sendall(req); data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = c.recv(4096)
+                if not chunk: return False, "the connection closed during the WebSocket upgrade"
+                data += chunk
+            head, _, rest = data.partition(b"\r\n\r\n")
+            if b" 101 " not in head.split(b"\r\n")[0] + b" ": return False, "WebSocket upgrade refused: " + head.split(b"\r\n")[0].decode(errors="replace")
+            ws = _WS(c, rest)
+            step = "reading the server's version"; banner = ws.read(12)
+            if not banner.startswith(b"RFB "): return False, f"not a VNC server: {banner!r}"
+            ws.send(b"RFB 003.008\n")
+            step = "reading the security types"; n = ws.read(1)[0]
+            if n == 0:
+                ln = struct.unpack(">I", ws.read(4))[0]; return False, "the server refused the connection: " + ws.read(ln).decode(errors="replace")
+            types = list(ws.read(n))
+            if 2 not in types: return False, f"the server offers security types {types}, not a password login"
+            ws.send(bytes([2]))
+            step = "waiting for the password challenge"; chal = ws.read(16)
+            ws.send(vnc_response(password, chal))
+            step = "waiting for the login result"
+            if struct.unpack(">I", ws.read(4))[0] != 0: return False, "the server refused the password"
+            ws.send(b"\x01")
+            step = "reading the screen description"; init = ws.read(24)
+            w, h = struct.unpack(">HH", init[:4]); nl = struct.unpack(">I", init[20:24])[0]; name = ws.read(nl).decode(errors="replace")
+            ws.send(struct.pack(">BBHHHH", 3, 0, 0, 0, min(w, 64), min(h, 64)))
+            step = "waiting for the first screen update"; kind = ws.read(1)[0]
+            if kind != 0: return False, f"unexpected first message {kind}"
+            return True, f"logged in; screen {w}x{h} named {name!r}; the first screen update arrived"
+    except (OSError, EOFError) as e:
+        return False, f"stopped while {step}: {e}"
+
 def mem_available_mb():
     try:
         for l in open("/proc/meminfo"):
@@ -512,6 +619,8 @@ def show_url(pw):
     emit("DESK-WEB", "PASS" if w else "FAIL", "the viewer page is served on port 6080" if w else "the viewer page is not served on port 6080: " + tail(os.path.join(ROOT, "tmp", "websockify.log"), 4))
     ok, why = ws_probe()
     emit("DESK-WS", "PASS" if ok else "FAIL", why if ok else why + " | " + tail(os.path.join(ROOT, "tmp", "websockify.log"), 5))
+    ok2, why2 = vnc_login(pw)
+    emit("DESK-LOGIN", "PASS" if ok2 else "FAIL", why2 if ok2 else why2 + " | " + tail(os.path.join(ROOT, "tmp", "xvnc.log"), 5))
     # "localhost" is not the address the in-app screen takes, so --browser reaches the browser.
     url = f"http://{'localhost' if USE_BROWSER else '127.0.0.1'}:6080/vnc.html?autoconnect=1&reconnect=true&reconnect_delay=2000&resize={RESIZE}&password={pw}"
     emit("DESK-URL", "PASS", url)
@@ -584,7 +693,19 @@ def cmd_status(args):
     try: d = json.load(open(PIDF)); os.kill(d["pid"], 0); print(f"running, pid {d['pid']}, the editor uses about {rss_mb()} MB of memory, {mem_available_mb()} MB is free")
     except Exception: print("not running")
 
+def acquire_lock():
+    """One mutating command at a time: two at once (a setup in one terminal, a start in another) leave a
+    half-unpacked Debian behind, which is how a system ends up with no /usr/bin/env."""
+    import fcntl
+    os.makedirs(BASE, exist_ok=True)
+    f = open(os.path.join(BASE, "desktop.lock"), "w")
+    try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("Another desktop.py command is still running. Wait for it to finish, then run this again.", flush=True); sys.exit(1)
+    return f
+
 if __name__ == "__main__":
     c = sys.argv[1] if len(sys.argv) > 1 else "help"
+    LOCK = acquire_lock() if c in ("setup", "install", "display", "start", "go", "trial", "repair", "stop") else None
     c = {"-h": "help", "--help": "help"}.get(c, c)
     {"install": cmd_install, "shell": cmd_shell, "display": cmd_display, "start": cmd_start, "stop": cmd_stop, "status": cmd_status, "trial": cmd_go, "go": cmd_go, "repair": cmd_go, "setup": cmd_setup}.get(c, lambda a: print(__doc__))(sys.argv[2:])
