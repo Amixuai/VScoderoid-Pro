@@ -61,6 +61,12 @@ internal object DesktopAddress {
 class DesktopActivity : AppCompatActivity() {
     private val tag = "DesktopActivity"
     private var webView: WebView? = null
+    private var lastViewerStatus = ""
+
+    private companion object {
+        /** Prefix for a status line in the diagnostic note; a developer aid, not interface text. */
+        const val VIEWER_SAYS = "viewer: "
+    }
 
     @SuppressLint("SetJavaScriptEnabled", "SetTextI18n")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -100,7 +106,9 @@ class DesktopActivity : AppCompatActivity() {
             webChromeClient = object : WebChromeClient() {
                 override fun onConsoleMessage(message: ConsoleMessage): Boolean {
                     val level = message.messageLevel()
-                    if (level == ConsoleMessage.MessageLevel.ERROR || level == ConsoleMessage.MessageLevel.WARNING) {
+                    if ((level == ConsoleMessage.MessageLevel.ERROR || level == ConsoleMessage.MessageLevel.WARNING) &&
+                        !message.message().contains("preload")
+                    ) {
                         val shown = message.message().replace(Regex("password=[^&\\s'\"]*"), "password=...")
                         note.post {
                             note.text = appendNote(note.text.toString(), shown)
@@ -141,6 +149,25 @@ class DesktopActivity : AppCompatActivity() {
         // the page, and reloading it would drop the session.
         if (savedInstanceState == null) view.loadUrl(address.toString())
         view.requestFocus()
+        pollViewerStatus(view, note)
+    }
+
+    /**
+     * What the noVNC page says about the connection ("Connecting", "Disconnected", ...), checked every
+     * few seconds and added to the note when it changes. With automatic reconnect the page can keep
+     * trying behind a spinner, and this is the only way to see that from outside the page.
+     */
+    @SuppressLint("SetTextI18n")
+    private fun pollViewerStatus(view: WebView, note: TextView) {
+        view.evaluateJavascript("(function(){var s=document.getElementById('noVNC_status');return s?s.textContent:''})()") { raw ->
+            val text = raw?.trim('"').orEmpty()
+            if (text.isNotEmpty() && text != "null" && text != lastViewerStatus) {
+                lastViewerStatus = text
+                note.text = appendNote(note.text.toString(), VIEWER_SAYS + text)
+                note.visibility = View.VISIBLE
+            }
+        }
+        view.postDelayed({ if (webView === view) pollViewerStatus(view, note) }, 3000)
     }
 
     /** The viewer's messages, newest last, kept short enough to fit above the keyboard. */
