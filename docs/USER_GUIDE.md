@@ -1072,6 +1072,8 @@ Other commands: `status` says whether it is running, `shell` opens a shell insid
   setting.
 - `status` shows whether it runs and how much memory the editor uses. `start` refuses to begin when under
   1 GB of memory is free (add `--force` to try anyway) and warns when under 1.8 GB is free.
+- Run one `desktop.py` command at a time and wait for it to finish; a second one started meanwhile
+  stops with a message instead of damaging the Debian system.
 - If the viewer shows "Failed to connect to server", run `stop` and then `start` again, and use the new
   address. Each start has its own password.
 - Do not press the full-screen button inside the viewer: its screen is already full size, and the button
