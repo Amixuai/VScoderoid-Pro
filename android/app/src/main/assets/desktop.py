@@ -29,7 +29,7 @@ URLS = [os.environ["DESKTOP_ROOTFS_URL"]] if os.environ.get("DESKTOP_ROOTFS_URL"
     f"https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/{RELEASE}/rootfs.tar.xz"]
 PINNED_SHA256 = os.environ.get("DESKTOP_ROOTFS_SHA256", "")      # fill in after the first run prints it
 WORKSPACE = os.environ.get("DESKTOP_WORKSPACE") or next((p for p in ("/storage/emulated/0/.VScoderoid-Pro", "/storage/emulated/0/VScoderoid-Pro") if os.path.isdir(p)), "/storage/emulated/0/.VScoderoid-Pro")
-GEOMETRY = os.environ.get("DESKTOP_GEOMETRY", "1280x720")
+GEOMETRY = os.environ.get("DESKTOP_GEOMETRY", "720x1280")   # phone-shaped; 720 px wide stays readable when shrunk to the phone
 USE_BROWSER = False   # --browser: open the address in the phone's browser instead of the screen inside the app
 RESIZE = "scale"      # how the viewer fits the screen: "scale" shrinks it to the window, "remote" resizes the desktop to the window
 MIN_RAM_MB = 5500
@@ -318,7 +318,7 @@ def cmd_display(args):
     if not ok:
         r = run_in(["/bin/sh", "-c", "apt-get install -y /tmp/codium.deb"], timeout=3600, host_extra={"PROOT_NO_SECCOMP": "1"}); ok = r.returncode == 0
     emit("DESK-EDITOR", "PASS" if ok else "FAIL", url if ok else excerpt(r.stdout + "\n" + r.stderr, 8))
-  
+
 DEFAULT_FLAGS = "--no-sandbox --disable-gpu --disable-dev-shm-usage --no-zygote --disable-setuid-sandbox --ozone-platform=x11"
 FLAGS_FILE = os.path.join(BASE, "flags.txt")
 
@@ -328,6 +328,9 @@ def current_flags():
 
 START_SH = """#!/bin/sh
 export DISPLAY=:1 ELECTRON_ENABLE_LOGGING=1
+# Plain local file access for the editor's dialogs: without it GTK tries to mount volumes through gvfs, which
+# does not exist here ("Unable to mount volume").
+export GIO_USE_VFS=local GTK_USE_PORTAL=0
 mkdir -p "$HOME/.vnc" "$HOME/workspace"
 # The password file for this session was written by desktop.py before this script started (see
 # write_vnc_password); it is never reused from an earlier start.
@@ -337,7 +340,6 @@ sleep 3
 openbox >/tmp/openbox.log 2>&1 &
 websockify --web /usr/share/novnc 127.0.0.1:6080 127.0.0.1:5901 >/tmp/websockify.log 2>&1 &
 sleep 2
-xterm -geometry 90x24+10+10 -e sh -c 'echo "VSCodroid desktop display works. Close this window when done."; exec sh' >/tmp/xterm.log 2>&1 &
 # Start the Electron binary itself: the "codium" command is only a launcher that opens the window in the
 # background and returns at once, so "codium exited" would be reported while the window is still running.
 CB=/usr/share/codium/codium
@@ -356,6 +358,32 @@ def load_config():
     except Exception:
         return DEFAULT_FLAGS, True
 
+OPENBOX_RC = """<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <applications>
+    <application class="*">
+      <maximized>yes</maximized>
+      <decor>no</decor>
+    </application>
+  </applications>
+</openbox_config>
+"""
+
+# Editor settings that suit a phone: the editor's own Open Folder dialog (a list in the editor, which sees the
+# workspace) instead of the GTK file chooser, and its own dialogs for everything else.
+EDITOR_SETTINGS = {"files.simpleDialog.enable": True, "window.dialogStyle": "custom"}
+
+def write_user_config():
+    home = os.path.join(ROOT, "home/user")
+    d = os.path.join(home, ".config/openbox"); os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "rc.xml"), "w") as f: f.write(OPENBOX_RC)
+    d = os.path.join(home, ".config/VSCodium/User"); os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "settings.json")
+    try: cur = json.load(open(path))
+    except Exception: cur = {}
+    cur.update(EDITOR_SETTINGS)
+    with open(path, "w") as f: json.dump(cur, f, indent=2)
+
 def ensure_user():
     """A normal user (uid 1000) inside Debian. Electron refuses some of its helper processes when they run as root."""
     for f, line in (("etc/passwd", "user:x:1000:1000:user:/home/user:/bin/bash"), ("etc/group", "user:x:1000:")):
@@ -363,6 +391,7 @@ def ensure_user():
         if "user:" not in open(p).read():
             with open(p, "a") as fh: fh.write(line + "\n")
     os.makedirs(os.path.join(ROOT, "home/user/workspace"), exist_ok=True)
+    write_user_config()
 
 def write_start_script(flags):
     p = os.path.join(ROOT, "usr/local/bin"); os.makedirs(p, exist_ok=True)
@@ -393,7 +422,6 @@ def write_vnc_password(password, user):
     ref = vncpasswd_reference(password, user); mine = vnc_obfuscate(password)
     data = ref[:8] if len(ref) >= 8 else mine
     if len(ref) >= 8 and ref[:8] != mine: emit("DESK-PASSWD", "WARN", f"vncpasswd wrote {ref[:8].hex()} but the built-in encoder gives {mine.hex()}; using vncpasswd's")
-    elif len(ref) < 8: emit("DESK-PASSWD", "WARN", "vncpasswd could not be run; using the built-in encoder")
     d = os.path.join(ROOT, "home/user/.vnc" if user else "root/.vnc"); os.makedirs(d, exist_ok=True)
     path = os.path.join(d, "passwd")
     if os.path.lexists(path): os.remove(path)
@@ -618,7 +646,6 @@ def vnc_login(password, timeout=20):
         return False, f"stopped while {step}: {e}"
 
 def server_reasons(n=8):
-  
     """The VNC server's own lines about connections and logins, without the statistics it prints on close."""
     try: lines = open(os.path.join(ROOT, "tmp", "xvnc.log"), errors="replace").read().splitlines()
     except OSError: return "(no server log)"
@@ -745,4 +772,3 @@ if __name__ == "__main__":
     LOCK = acquire_lock() if c in ("setup", "install", "display", "start", "go", "trial", "repair", "stop") else None
     c = {"-h": "help", "--help": "help"}.get(c, c)
     {"install": cmd_install, "shell": cmd_shell, "display": cmd_display, "start": cmd_start, "stop": cmd_stop, "status": cmd_status, "trial": cmd_go, "go": cmd_go, "repair": cmd_go, "setup": cmd_setup}.get(c, lambda a: print(__doc__))(sys.argv[2:])
-      
