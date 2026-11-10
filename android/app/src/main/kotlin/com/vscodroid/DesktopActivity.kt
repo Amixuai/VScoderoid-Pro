@@ -111,8 +111,7 @@ class DesktopActivity : AppCompatActivity() {
                     ) {
                         val shown = message.message().replace(Regex("password=[^&\\s'\"]*"), "password=...")
                         note.post {
-                            note.text = appendNote(note.text.toString(), shown)
-                            note.visibility = View.VISIBLE
+                            showNote(note, shown)
                         }
                     }
                     return true
@@ -163,14 +162,29 @@ class DesktopActivity : AppCompatActivity() {
             val text = raw?.trim('"').orEmpty()
             if (text.isNotEmpty() && text != "null" && text != lastViewerStatus) {
                 lastViewerStatus = text
-                note.text = appendNote(note.text.toString(), VIEWER_SAYS + text)
-                note.visibility = View.VISIBLE
+                showNote(note, VIEWER_SAYS + text)
             }
         }
         view.postDelayed({ if (webView === view) pollViewerStatus(view, note) }, 3000)
     }
 
-    /** The viewer's messages, newest last, kept short enough to fit above the keyboard. */
+        private var hideNote: Runnable? = null
+
+    /**
+     * Shows a line in the note and takes the note away again after a few seconds, so a message like
+     * "Connected" does not sit over the desktop for good. A new message restarts the wait.
+     */
+    private fun showNote(note: TextView, added: String) {
+        val soFar = if (note.visibility == View.VISIBLE) note.text.toString() else String()
+        note.text = appendNote(soFar, added)
+        note.visibility = View.VISIBLE
+        hideNote?.let { note.removeCallbacks(it) }
+        val hide = Runnable { note.visibility = View.GONE }
+        hideNote = hide
+        note.postDelayed(hide, 6000)
+    }
+
+/** The viewer's messages, newest last, kept short enough to fit above the keyboard. */
     private fun appendNote(shownSoFar: String, added: String): String =
         (shownSoFar + System.lineSeparator() + added).trim().takeLast(700)
 
