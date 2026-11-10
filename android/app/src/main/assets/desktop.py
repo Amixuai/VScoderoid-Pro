@@ -29,9 +29,10 @@ URLS = [os.environ["DESKTOP_ROOTFS_URL"]] if os.environ.get("DESKTOP_ROOTFS_URL"
     f"https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/{RELEASE}/rootfs.tar.xz"]
 PINNED_SHA256 = os.environ.get("DESKTOP_ROOTFS_SHA256", "")      # fill in after the first run prints it
 WORKSPACE = os.environ.get("DESKTOP_WORKSPACE") or next((p for p in ("/storage/emulated/0/.VScoderoid-Pro", "/storage/emulated/0/VScoderoid-Pro") if os.path.isdir(p)), "/storage/emulated/0/.VScoderoid-Pro")
-GEOMETRY = os.environ.get("DESKTOP_GEOMETRY", "720x1520")   # phone-shaped start size; the viewer then resizes it to its window
+GEOMETRY = os.environ.get("DESKTOP_GEOMETRY", "1080x2250")   # until the app has measured this phone (see load_screen)
+DENSITY = 2.5          # the phone's display density; the editor is drawn at this scale so text is readable at full resolution
 USE_BROWSER = False   # --browser: open the address in the phone's browser instead of the screen inside the app
-RESIZE = "remote"     # how the viewer fits the screen: "scale" shrinks it to the window, "remote" resizes the desktop to the window
+RESIZE = "scale"      # how the viewer fits the screen: "scale" shrinks it to the window, "remote" resizes the desktop to the window
 MIN_RAM_MB = 5500
 PHONE_STORAGE = "/storage/emulated/0"
 # Checksums of root file systems that were tested on a device. A file named here must match; a newer
@@ -435,7 +436,7 @@ def write_vnc_password(password, user):
 def spawn(pw, flags, user, host_extra=None):
     left = kill_session_processes()
     if left: emit("DESK-CLEAN", "WARN", f"{left} processes of an earlier session were still running and were ended")
-    ensure_user(); script = write_start_script(flags); write_vnc_password(pw, user)
+    ensure_user(); script = write_start_script(effective_flags(flags)); write_vnc_password(pw, user)
     home = "/home/user" if user else "/root"
     binds = [f"{WORKSPACE}:{home}/workspace"] if os.path.isdir(WORKSPACE) else []
     # The phone's own storage, so Open Folder can reach Download, Documents and every other folder. The app already
@@ -691,21 +692,41 @@ def show_url(pw):
     ok2, why2 = vnc_login(pw)
     emit("DESK-LOGIN", "PASS" if ok2 else "FAIL", why2 if ok2 else why2 + " | " + server_reasons())
     # "localhost" is not the address the in-app screen takes, so --browser reaches the browser.
-    url = f"http://{'localhost' if USE_BROWSER else '127.0.0.1'}:6080/vnc.html?autoconnect=1&reconnect=true&reconnect_delay=2000&resize={RESIZE}&password={pw}"
+    url = f"http://{'localhost' if USE_BROWSER else '127.0.0.1'}:6080/vnc.html?autoconnect=1&reconnect=true&reconnect_delay=2000&resize={RESIZE}&quality=9&compression=2&password={pw}"
     emit("DESK-URL", "PASS", url)
     opened = "--no-open" not in sys.argv and open_in_browser(url)
     print("\nThe desktop is running." + (" It was opened in your browser." if opened else " Open this address in the phone's browser:"), flush=True)
     print(f"  {url}\n(stop it later with: python3 ~/.vscodroid/desktop.py stop)\n", flush=True)
 
+def load_screen():
+    """Use this phone's own screen: the app writes its size in pixels and its density to ~/.vscodroid/screen.json
+    the first time the desktop screen opens. The desktop is then made exactly that many pixels wide and tall, so
+    every desktop pixel is one pixel of the phone (sharp), and the editor is scaled by the density (readable)."""
+    global GEOMETRY, DENSITY
+    try:
+        d = json.load(open(os.path.join(HOME, ".vscodroid", "screen.json")))
+        w, h, dens = int(d["width"]), int(d["height"]), float(d["density"])
+        if 400 <= w <= 2160 and 600 <= h <= 4800 and 1.0 <= dens <= 6.0:
+            if not os.environ.get("DESKTOP_GEOMETRY"): GEOMETRY = f"{w - w % 2}x{h - h % 2}"
+            DENSITY = round(dens, 2)
+    except Exception: pass
+
+def effective_flags(flags):
+    return f"{flags} --force-device-scale-factor={DENSITY}"
+
 def apply_options(args):
+    load_screen()
     """Options for one run of start/repair: --geometry=WxH, --remote, --scale. Anything else is ignored."""
-    global GEOMETRY, RESIZE, USE_BROWSER
+    global GEOMETRY, RESIZE, USE_BROWSER, DENSITY
     for a in args:
         if a.startswith("--geometry="):
             g = a.split("=", 1)[1]
             if re.fullmatch(r"\d{3,4}x\d{3,4}", g): GEOMETRY = g
             else: print("ignored --geometry: use WIDTHxHEIGHT, for example --geometry=1080x1920", flush=True)
         elif a == "--browser": USE_BROWSER = True
+        elif a.startswith("--density="):
+            try: DENSITY = float(a.split("=", 1)[1])
+            except ValueError: print("ignored --density: use a number such as --density=2.6", flush=True)
         elif a == "--remote": RESIZE = "remote"
         elif a == "--scale": RESIZE = "scale"
 
