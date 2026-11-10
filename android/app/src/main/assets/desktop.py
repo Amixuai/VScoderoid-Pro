@@ -29,10 +29,11 @@ URLS = [os.environ["DESKTOP_ROOTFS_URL"]] if os.environ.get("DESKTOP_ROOTFS_URL"
     f"https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/{RELEASE}/rootfs.tar.xz"]
 PINNED_SHA256 = os.environ.get("DESKTOP_ROOTFS_SHA256", "")      # fill in after the first run prints it
 WORKSPACE = os.environ.get("DESKTOP_WORKSPACE") or next((p for p in ("/storage/emulated/0/.VScoderoid-Pro", "/storage/emulated/0/VScoderoid-Pro") if os.path.isdir(p)), "/storage/emulated/0/.VScoderoid-Pro")
-GEOMETRY = os.environ.get("DESKTOP_GEOMETRY", "720x1280")   # phone-shaped; 720 px wide stays readable when shrunk to the phone
+GEOMETRY = os.environ.get("DESKTOP_GEOMETRY", "720x1520")   # phone-shaped start size; the viewer then resizes it to its window
 USE_BROWSER = False   # --browser: open the address in the phone's browser instead of the screen inside the app
-RESIZE = "scale"      # how the viewer fits the screen: "scale" shrinks it to the window, "remote" resizes the desktop to the window
+RESIZE = "remote"     # how the viewer fits the screen: "scale" shrinks it to the window, "remote" resizes the desktop to the window
 MIN_RAM_MB = 5500
+PHONE_STORAGE = "/storage/emulated/0"
 # Checksums of root file systems that were tested on a device. A file named here must match; a newer
 # release is accepted only when GitHub publishes its digest (see discover_rootfs).
 KNOWN_SHA256 = {"debian-trixie-aarch64-pd-v4.29.0.tar.xz": "3834a11cbc6496935760bdc20cca7e2c25724d0cd8f5e4926da8fd5ca1857918"}
@@ -391,6 +392,8 @@ def ensure_user():
         if "user:" not in open(p).read():
             with open(p, "a") as fh: fh.write(line + "\n")
     os.makedirs(os.path.join(ROOT, "home/user/workspace"), exist_ok=True)
+    link = os.path.join(ROOT, "home/user/phone")      # shows up in the editor's folder list next to "workspace"
+    if not os.path.lexists(link): os.symlink(PHONE_STORAGE, link)
     write_user_config()
 
 def write_start_script(flags):
@@ -435,6 +438,9 @@ def spawn(pw, flags, user, host_extra=None):
     ensure_user(); script = write_start_script(flags); write_vnc_password(pw, user)
     home = "/home/user" if user else "/root"
     binds = [f"{WORKSPACE}:{home}/workspace"] if os.path.isdir(WORKSPACE) else []
+    # The phone's own storage, so Open Folder can reach Download, Documents and every other folder. The app already
+    # holds All Files Access; this only shows that storage inside Debian, under the same paths Android uses.
+    if os.path.isdir(PHONE_STORAGE): binds += [f"{PHONE_STORAGE}:{PHONE_STORAGE}", f"{PHONE_STORAGE}:/sdcard"]
     env = host_env(); env.update(host_extra or {})
     log = open(os.path.join(BASE, "desktop.log"), "w")
     p = subprocess.Popen(proot_cmd(["/bin/sh", script], binds, extra_env=[f"VNC_PW={pw}"], user=user), stdout=log, stderr=log, start_new_session=True, env=env)
