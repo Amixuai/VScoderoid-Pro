@@ -19,6 +19,8 @@ import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import org.json.JSONObject
+import java.io.File
 import com.vscodroid.util.Logger
 import com.vscodroid.util.drawBehindSystemBars
 import com.vscodroid.util.padForSystemBars
@@ -148,6 +150,7 @@ class DesktopActivity : AppCompatActivity() {
         // the page, and reloading it would drop the session.
         if (savedInstanceState == null) view.loadUrl(address.toString())
         view.requestFocus()
+        view.post { rememberScreen(view) }
         pollViewerStatus(view, note)
     }
 
@@ -168,7 +171,23 @@ class DesktopActivity : AppCompatActivity() {
         view.postDelayed({ if (webView === view) pollViewerStatus(view, note) }, 3000)
     }
 
-        private var hideNote: Runnable? = null
+        /**
+     * Writes this phone's screen (the viewer's size in real pixels, and the display density) where
+     * `desktop.py start` reads it, so the desktop is made exactly as many pixels as the screen has and
+     * is sharp on any phone, whatever its resolution. Nothing here is sent anywhere; it is one small file.
+     */
+    private fun rememberScreen(view: WebView) {
+        val w = view.width
+        val h = view.height
+        if (w < 200 || h < 200) return
+        runCatching {
+            val file = File(filesDir, "home/.vscodroid/screen.json")
+            file.parentFile?.mkdirs()
+            file.writeText(JSONObject().put("width", w).put("height", h).put("density", resources.displayMetrics.density.toDouble()).toString())
+        }
+    }
+
+    private var hideNote: Runnable? = null
 
     /**
      * Shows a line in the note and takes the note away again after a few seconds, so a message like
