@@ -301,7 +301,7 @@ jobs:
         run: python3 scripts/check-server-published.py
 
       - name: Set up JDK 17
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           java-version: "17"
           distribution: "temurin"
@@ -324,7 +324,7 @@ jobs:
           node-version: "24"
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
         with:
           # Pinned to the open-source implementation, not left to the default.
           #
@@ -1177,7 +1177,7 @@ jobs:
       # and those describe its decisions, not a stack trace; r8.yml keeps the
       # whole directory for exactly that purpose.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           generate_release_notes: true
           # Defaults to false, which is how a release publishes one asset short
