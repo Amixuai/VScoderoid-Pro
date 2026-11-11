@@ -702,13 +702,14 @@ def load_screen():
     """Use this phone's own screen: the app writes its size in pixels and its density to ~/.vscodroid/screen.json
     the first time the desktop screen opens. The desktop is then made exactly that many pixels wide and tall, so
     every desktop pixel is one pixel of the phone (sharp), and the editor is scaled by the density (readable)."""
-    global GEOMETRY, DENSITY
+    global GEOMETRY, DENSITY, RESIZE
     try:
         d = json.load(open(os.path.join(HOME, ".vscodroid", "screen.json")))
         w, h, dens = int(d["width"]), int(d["height"]), float(d["density"])
         if 400 <= w <= 2160 and 600 <= h <= 4800 and 1.0 <= dens <= 6.0:
             if not os.environ.get("DESKTOP_GEOMETRY"): GEOMETRY = f"{w - w % 2}x{h - h % 2}"
             DENSITY = round(dens, 2)
+            RESIZE = "scale"   # the desktop already has the phone's own pixel size; the viewer must not resize it
     except Exception: pass
 
 def effective_flags(flags):
