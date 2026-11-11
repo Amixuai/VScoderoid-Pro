@@ -109,7 +109,7 @@ class DesktopActivity : AppCompatActivity() {
                 override fun onConsoleMessage(message: ConsoleMessage): Boolean {
                     val level = message.messageLevel()
                     if ((level == ConsoleMessage.MessageLevel.ERROR || level == ConsoleMessage.MessageLevel.WARNING) &&
-                        !message.message().contains("preload")
+                        !(message.message().contains("preload") || message.message().contains("touchcancel"))
                     ) {
                         val shown = message.message().replace(Regex("password=[^&\\s'\"]*"), "password=...")
                         note.post {
